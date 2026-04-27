@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from datasets import load_dataset
 from tqdm import tqdm
 
@@ -561,11 +562,27 @@ def main(args: argparse.Namespace):
     print(f"Jax devices: {jax.devices()}")
     print(f"Jax backend: {jax.default_backend()}")
 
+    # ---- Device mesh for data parallelism ----
+    devices = np.array(jax.devices())
+    n_devices = len(devices)
+    mesh = Mesh(devices, ("data",))
+    data_sharding = NamedSharding(mesh, P("data", None))  # (B, T) sharded on B
+    repl_sharding = NamedSharding(mesh, P())              # replicated everywhere
+
+    if args.batch_size % n_devices != 0:
+        raise ValueError(
+            f"batch_size ({args.batch_size}) must be divisible by num devices ({n_devices})"
+        )
+    print(
+        f"Devices: {n_devices}, global batch: {args.batch_size}, "
+        f"per-device batch: {args.batch_size // n_devices}"
+    )
+
     # ---- Config & model ----
     config = build_config(args)
     model = LogosTransformer(config)
 
-    # Init
+    # Init (on default device; we replicate immediately after)
     key = jax.random.PRNGKey(args.seed)
     key, init_key = jax.random.split(key)
     dummy_ids = jnp.ones((args.batch_size, args.max_length), dtype=jnp.int32)
@@ -577,6 +594,11 @@ def main(args: argparse.Namespace):
 
     print(f"Trainable params: {count_parameters(params):,}")
 
+    # Replicate params + non-param variables across the mesh
+    params = jax.device_put(params, repl_sharding)
+    moe_vars = jax.device_put(moe_vars, repl_sharding)
+    key = jax.device_put(key, repl_sharding)
+
     # ---- Schedule ----
     total_tokens = _parse_tokens(args.total_tokens)
     tokens_per_step = args.batch_size * args.max_length
@@ -587,6 +609,7 @@ def main(args: argparse.Namespace):
     # ---- Optimizer ----
     optimizer = build_optimizer(args, params, total_steps)
     opt_state = optimizer.init(params)
+    opt_state = jax.device_put(opt_state, repl_sharding)
 
     # ---- Checkpointing ----
     save_dir = Path(args.save_dir)
@@ -609,6 +632,10 @@ def main(args: argparse.Namespace):
             args=ocp.args.StandardRestore(template.to_checkpoint()),
         )
         state = TrainState.from_checkpoint(restored, opt_state, key)
+        # Re-shard restored leaves onto the mesh (Orbax may return host arrays)
+        state.params = jax.device_put(state.params, repl_sharding)
+        state.variables = jax.device_put(state.variables, repl_sharding)
+        state.opt_state = jax.device_put(state.opt_state, repl_sharding)
     else:
         print("Starting fresh training")
         state = TrainState(step=0, params=params, opt_state=opt_state,
@@ -633,9 +660,11 @@ def main(args: argparse.Namespace):
     steps_since_log = 0
 
     for batch_idx, (input_ids, labels) in enumerate(loader):
+        input_ids = jax.device_put(jnp.asarray(input_ids), data_sharding)
+        labels = jax.device_put(jnp.asarray(labels), data_sharding)
         state, ce_loss, aux_loss = train_step(
             state, model, optimizer,
-            jnp.array(input_ids), jnp.array(labels),
+            input_ids, labels,
             training=True,
         )
 
