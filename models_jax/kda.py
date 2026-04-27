@@ -47,6 +47,7 @@ def _causal_depthwise_conv1d(
 
 @functools.partial(jax.jit, static_argnames=(
     "chunk_size", "use_qk_l2norm", "do_snapshots",
+    "chunks_per_snapshot", "compressor_norm_eps", "out_dtype",
 ))
 def _kda_chunk_scan(
     q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray,
@@ -137,7 +138,7 @@ def _kda_chunk_scan(
 
         delta = effective_v[:, :, n] - jnp.einsum("bhkv,bhck->bhcv", S, effective_w[:, :, n])
         o_inter = jnp.einsum("bhkv,bhck->bhcv", S, q_tilde[:, :, n])
-        o_chunk = o_inter + jnp.einsum("bhncj,bhnij->bhnci", delta, intra_attn[:, :, n])
+        o_chunk = o_inter + jnp.einsum("bhij,bhjv->bhiv", intra_attn[:, :, n], delta)
 
         outputs = outputs.at[n].set(o_chunk)
 
@@ -161,7 +162,7 @@ def _kda_chunk_scan(
         0, Nc, body_fn, (S0, outputs, snap_latents)
     )
 
-    out = outputs.transpose(1, 0, 2, 3, 4).reshape(B, Tp, H, V)
+    out = outputs.transpose(1, 0, 3, 2, 4).reshape(B, Tp, H, V)
     if pad > 0:
         out = out[:, :T]
     out = out.astype(orig_dtype)
