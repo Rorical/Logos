@@ -78,9 +78,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--swa-offset", type=int, default=3)
 
     # MoE
-    p.add_argument(
-        "--use-moe", action=argparse.BooleanOptionalAction, default=True,
-    )
+    p.add_argument("--use-moe", action="store_true", default=True)
     p.add_argument("--num-shared-experts", type=int, default=2)
     p.add_argument("--num-sparse-experts", type=int, default=32)
     p.add_argument("--top-k", type=int, default=4)
