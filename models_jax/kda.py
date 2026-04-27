@@ -94,7 +94,7 @@ def _kda_chunk_scan(
     log_g_c = log_g.reshape(B, Nc, C, H, K).transpose(0, 3, 1, 2, 4)
     beta_c = beta.reshape(B, Nc, C, H).transpose(0, 3, 1, 2)
 
-    cum_log_g = jnp.cumsum(log_g_c, axis=2).clip(min=-15.0)
+    cum_log_g = jnp.cumsum(log_g_c, axis=3).clip(min=-15.0)
     W = jnp.exp(cum_log_g)
     W_inv = jnp.exp(-cum_log_g)
 
@@ -236,7 +236,7 @@ class SuperKimiDeltaAttention(nn.Module):
             jax.random.uniform(key, (size,), dtype=jnp.float32)
             * (math.log(0.1) - math.log(0.001)) + math.log(0.001)
         )
-        dt = jnp.clip(dt, a_min=1e-4)
+        dt = jnp.clip(dt, min=1e-4)
         return dt + jnp.log(-jnp.expm1(-dt))
 
     def __call__(

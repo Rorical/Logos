@@ -36,8 +36,9 @@ class SparseExpertBank(nn.Module):
         h_gate = jnp.einsum("ecd,efd->ecf", expert_in, w_gate)
         h_up = jnp.einsum("ecd,efd->ecf", expert_in, w_up)
         hidden = jax.nn.silu(h_gate) * h_up
-        hidden = nn.Dropout(rate=self.dropout)(hidden, deterministic=deterministic)
-        return jnp.einsum("ecf,edf->ecd", hidden, w_down)
+        out = jnp.einsum("ecf,edf->ecd", hidden, w_down)
+        out = nn.Dropout(rate=self.dropout)(out, deterministic=deterministic)
+        return out
 
 
 class Router(nn.Module):
@@ -133,7 +134,7 @@ class MoELayer(nn.Module):
         is_first = jnp.concatenate([
             jnp.ones(1, dtype=jnp.bool_), diff,
         ])
-        group_starts = jnp.maximum.accumulate(
+        group_starts = jax.lax.cummax(
             positions * is_first.astype(jnp.int32)
         )
         slot_indices = positions - group_starts

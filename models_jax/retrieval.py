@@ -132,8 +132,8 @@ class SnapshotRetrieval(nn.Module):
 
         freqs = positions.astype(jnp.float32)[..., None] * inv_freq.astype(jnp.float32)
         emb = jnp.concatenate([freqs, freqs], axis=-1)
-        cos = emb.cos().astype(target.dtype)
-        sin = emb.sin().astype(target.dtype)
+        cos = jnp.cos(emb).astype(target.dtype)
+        sin = jnp.sin(emb).astype(target.dtype)
         rotated = target * cos + self._rotate_half(target) * sin
         if self._rope_attention_scaling != 1.0:
             rotated = rotated * self._rope_attention_scaling

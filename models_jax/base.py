@@ -61,8 +61,8 @@ class RotaryEmbedding:
         t = jnp.arange(max_seq_len, dtype=jnp.float32)
         freqs = jnp.einsum("i,j->ij", t, inv_freq)
         emb = jnp.concatenate([freqs, freqs], axis=-1)
-        self.cos = emb.cos()
-        self.sin = emb.sin()
+        self.cos = jnp.cos(emb)
+        self.sin = jnp.sin(emb)
 
     def rotate_half(self, x: jnp.ndarray) -> jnp.ndarray:
         x1, x2 = jnp.split(x, 2, axis=-1)
