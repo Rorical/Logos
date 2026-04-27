@@ -533,11 +533,12 @@ def build_optimizer(
     if args.muon:
         optimizer = optax.contrib.muon(
             learning_rate=muon_schedule,
-            adamw_learning_rate=adamw_schedule,
             weight_decay=args.weight_decay,
             muon_weight_dimension_numbers=muon_dim_nums,
-            b1=0.9,
-            b2=0.95,
+            adam_learning_rate=adamw_schedule,
+            adam_b1=0.9,
+            adam_b2=0.95,
+            adam_weight_decay=args.weight_decay,
         )
     else:
         optimizer = optax.adamw(
