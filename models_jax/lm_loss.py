@@ -48,18 +48,20 @@ def chunked_linear_cross_entropy(
     t_chunked = safe_targets.reshape(n_chunks, chunk_size)
     v_chunked = valid.reshape(n_chunks, chunk_size).astype(jnp.float32)
 
-    def per_chunk(carry, inputs):
-        h, t, v = inputs
+    # Python-unrolled chunk loop: backprop through lax.scan with a closure-
+    # captured parameter (here `weight`) has produced fragile HLO under
+    # autograd on TPU. n_chunks is concrete (derived from static shapes),
+    # so unrolling at trace time is safe and the graph stays bounded.
+    total = jnp.zeros((), dtype=jnp.float32)
+    for i in range(n_chunks):
+        h = h_chunked[i]
+        t = t_chunked[i]
+        v = v_chunked[i]
         logits = (h @ weight.T).astype(jnp.float32)
         log_z = jax.nn.logsumexp(logits, axis=-1)
         target_logits = jnp.take_along_axis(logits, t[:, None], axis=-1).squeeze(-1)
-        chunk_loss = ((log_z - target_logits) * v).sum()
-        return carry + chunk_loss, None
+        total = total + ((log_z - target_logits) * v).sum()
 
-    total, _ = jax.lax.scan(
-        per_chunk, jnp.zeros((), dtype=jnp.float32),
-        (h_chunked, t_chunked, v_chunked),
-    )
     return total / count
 
 
