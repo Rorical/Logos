@@ -28,6 +28,7 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 from flax import struct
+from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from datasets import load_dataset
 from tqdm import tqdm
@@ -354,44 +355,81 @@ def compute_loss(
 def make_train_step(
     model: LogosTransformer,
     optimizer: optax.GradientTransformation,
+    mesh: Mesh,
 ):
-    """Build a jit-compiled train_step closing over model + optimizer.
+    """Build a jit-compiled train_step using shard_map for explicit DP.
 
-    model/optimizer are not jit-static args — they're closure values, so
-    LogosTransformer/LogosConfig don't need to be hashable. `training` is
-    static via static_argnames so the no-grad eval branch traces only when
-    actually used.
+    model/optimizer are closure values (not jit-static args). The
+    forward+backward runs inside shard_map: each device sees its local
+    shard of the batch, routes MoE locally, and we pmean grads/losses
+    across the 'data' axis. This avoids XLA SPMD partitioner failures
+    on ops like `.at[idx].set(...)` with sharded indices.
     """
-    @functools.partial(jax.jit, static_argnames=("training",))
+    has_mutable_state = True  # moe_state is registered even if currently inert
+
+    def per_device_loss_grad(params, variables, input_ids, labels, key):
+        # Per-device dropout key
+        key = jax.random.fold_in(key, jax.lax.axis_index("data"))
+
+        def loss_fn(p):
+            output = model.apply(
+                {"params": p, **variables},
+                input_ids, labels=labels,
+                deterministic=False,
+                mutable=list(variables.keys()) if has_mutable_state else [],
+                rngs={"dropout": key},
+            )
+            if has_mutable_state and variables:
+                outputs_dict, updated = output
+            else:
+                outputs_dict, updated = output, {}
+            ce = outputs_dict["loss"]
+            aux = outputs_dict.get("aux_loss", jnp.zeros((), dtype=ce.dtype))
+            if aux is None:
+                aux = jnp.zeros((), dtype=ce.dtype)
+            return ce + aux, (ce, aux, updated)
+
+        (_, (ce, aux, updated_vars)), grads = jax.value_and_grad(
+            loss_fn, has_aux=True,
+        )(params)
+
+        # Average across devices on the 'data' axis
+        grads = jax.lax.pmean(grads, axis_name="data")
+        ce = jax.lax.pmean(ce, axis_name="data")
+        aux = jax.lax.pmean(aux, axis_name="data")
+        if updated_vars:
+            updated_vars = jax.lax.pmean(updated_vars, axis_name="data")
+        return ce, aux, grads, updated_vars
+
+    sharded_step = shard_map(
+        per_device_loss_grad,
+        mesh=mesh,
+        in_specs=(P(), P(), P("data", None), P("data", None), P()),
+        out_specs=(P(), P(), P(), P()),
+        check_rep=False,
+    )
+
+    @jax.jit
     def train_step(
         state: TrainState,
         input_ids: jnp.ndarray,
         labels: jnp.ndarray,
-        training: bool = True,
     ) -> Tuple[TrainState, jnp.ndarray, jnp.ndarray]:
         key, subkey = jax.random.split(state.key)
 
-        (total_loss, (ce_loss, aux_loss, updated_vars)), grads = jax.value_and_grad(
-            compute_loss, argnums=0, has_aux=True,
-        )(
-            state.params, state.variables, model,
-            input_ids, labels, subkey, training,
+        ce_loss, aux_loss, grads, updated_vars = sharded_step(
+            state.params, state.variables,
+            input_ids, labels, subkey,
         )
 
-        if training:
-            updates, new_opt_state = optimizer.update(
-                grads, state.opt_state, state.params,
-            )
-            new_params = optax.apply_updates(state.params, updates)
-            new_variables = {**state.variables, **updated_vars}
-        else:
-            new_params = state.params
-            new_opt_state = state.opt_state
-            new_variables = state.variables
+        updates, new_opt_state = optimizer.update(
+            grads, state.opt_state, state.params,
+        )
+        new_params = optax.apply_updates(state.params, updates)
+        new_variables = {**state.variables, **updated_vars} if updated_vars else state.variables
 
-        new_step = state.step + 1 if training else state.step
         new_state = state.replace(
-            step=new_step,
+            step=state.step + 1,
             params=new_params,
             opt_state=new_opt_state,
             variables=new_variables,
@@ -668,8 +706,8 @@ def main(args: argparse.Namespace):
         tokenizer, args.batch_size, args.max_length, args.seed,
     )
 
-    # ---- Train step (closes over model + optimizer) ----
-    train_step = make_train_step(model, optimizer)
+    # ---- Train step (closes over model + optimizer + mesh) ----
+    train_step = make_train_step(model, optimizer, mesh)
 
     # ---- Training loop ----
     log_every = args.log_every
@@ -685,9 +723,7 @@ def main(args: argparse.Namespace):
     for batch_idx, (input_ids, labels) in enumerate(loader):
         input_ids = jax.device_put(jnp.asarray(input_ids), data_sharding)
         labels = jax.device_put(jnp.asarray(labels), data_sharding)
-        state, ce_loss, aux_loss = train_step(
-            state, input_ids, labels, training=True,
-        )
+        state, ce_loss, aux_loss = train_step(state, input_ids, labels)
 
         running_loss += float(ce_loss)
         running_aux += float(aux_loss)
