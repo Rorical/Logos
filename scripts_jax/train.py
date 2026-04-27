@@ -351,46 +351,56 @@ def compute_loss(
 # Train step (jit-compiled)
 # ---------------------------------------------------------------------------
 
-@functools.partial(jax.jit, static_argnames=("model", "optimizer", "training"))
-def train_step(
-    state: TrainState,
+def make_train_step(
     model: LogosTransformer,
     optimizer: optax.GradientTransformation,
-    input_ids: jnp.ndarray,
-    labels: jnp.ndarray,
-    training: bool = True,
-) -> Tuple[TrainState, jnp.ndarray, jnp.ndarray]:
-    """Single step: forward, backward, optimizer update."""
-    key, subkey = jax.random.split(state.key)
+):
+    """Build a jit-compiled train_step closing over model + optimizer.
 
-    (total_loss, (ce_loss, aux_loss, updated_vars)), grads = jax.value_and_grad(
-        compute_loss, argnums=0, has_aux=True,
-    )(
-        state.params, state.variables, model,
-        input_ids, labels, subkey, training,
-    )
+    model/optimizer are not jit-static args — they're closure values, so
+    LogosTransformer/LogosConfig don't need to be hashable. `training` is
+    static via static_argnames so the no-grad eval branch traces only when
+    actually used.
+    """
+    @functools.partial(jax.jit, static_argnames=("training",))
+    def train_step(
+        state: TrainState,
+        input_ids: jnp.ndarray,
+        labels: jnp.ndarray,
+        training: bool = True,
+    ) -> Tuple[TrainState, jnp.ndarray, jnp.ndarray]:
+        key, subkey = jax.random.split(state.key)
 
-    if training:
-        updates, new_opt_state = optimizer.update(
-            grads, state.opt_state, state.params,
+        (total_loss, (ce_loss, aux_loss, updated_vars)), grads = jax.value_and_grad(
+            compute_loss, argnums=0, has_aux=True,
+        )(
+            state.params, state.variables, model,
+            input_ids, labels, subkey, training,
         )
-        new_params = optax.apply_updates(state.params, updates)
-        new_variables = {**state.variables, **updated_vars}
-    else:
-        new_params = state.params
-        new_opt_state = state.opt_state
-        new_variables = state.variables
 
-    new_step = state.step + 1 if training else state.step
-    new_state = state.replace(
-        step=new_step,
-        params=new_params,
-        opt_state=new_opt_state,
-        variables=new_variables,
-        key=key,
-    )
+        if training:
+            updates, new_opt_state = optimizer.update(
+                grads, state.opt_state, state.params,
+            )
+            new_params = optax.apply_updates(state.params, updates)
+            new_variables = {**state.variables, **updated_vars}
+        else:
+            new_params = state.params
+            new_opt_state = state.opt_state
+            new_variables = state.variables
 
-    return new_state, ce_loss, aux_loss
+        new_step = state.step + 1 if training else state.step
+        new_state = state.replace(
+            step=new_step,
+            params=new_params,
+            opt_state=new_opt_state,
+            variables=new_variables,
+            key=key,
+        )
+
+        return new_state, ce_loss, aux_loss
+
+    return train_step
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +638,8 @@ def main(args: argparse.Namespace):
         print(f"Resuming from step {latest_step}")
         # Create empty template for structure restoration
         template = TrainState(
-            step=0, params=params, opt_state=opt_state,
+            step=jnp.zeros((), dtype=jnp.int32),
+            params=params, opt_state=opt_state,
             variables=moe_vars, key=key,
         )
         restored = checkpointer.restore(
@@ -657,6 +668,9 @@ def main(args: argparse.Namespace):
         tokenizer, args.batch_size, args.max_length, args.seed,
     )
 
+    # ---- Train step (closes over model + optimizer) ----
+    train_step = make_train_step(model, optimizer)
+
     # ---- Training loop ----
     log_every = args.log_every
     save_every = args.save_every
@@ -672,9 +686,7 @@ def main(args: argparse.Namespace):
         input_ids = jax.device_put(jnp.asarray(input_ids), data_sharding)
         labels = jax.device_put(jnp.asarray(labels), data_sharding)
         state, ce_loss, aux_loss = train_step(
-            state, model, optimizer,
-            input_ids, labels,
-            training=True,
+            state, input_ids, labels, training=True,
         )
 
         running_loss += float(ce_loss)
