@@ -123,9 +123,10 @@ class LocalAttention(nn.Module):
             weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(scores.dtype)
 
         if not deterministic and self.dropout > 0:
+            dropout_key = self.make_rng('dropout')
             keep_prob = 1.0 - self.dropout
-            # Dropout under jax — we use a rng key, but for simplicity skip in module
-            pass
+            mask = jax.random.bernoulli(dropout_key, keep_prob, weights.shape).astype(weights.dtype)
+            weights = weights * mask / keep_prob
 
         out = jnp.einsum("bhts,bhsd->bhtd", weights, v)
         out = out.transpose(0, 2, 1, 3).reshape(B, T, D)
