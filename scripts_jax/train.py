@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
+from flax import struct
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from datasets import load_dataset
 from tqdm import tqdm
@@ -276,13 +277,14 @@ def create_wsd_schedule(
 # Training state
 # ---------------------------------------------------------------------------
 
-@dataclass
+@struct.dataclass
 class TrainState:
-    step: int
+    """Pytree-registered state. Frozen — use .replace(...) to update."""
+    step: jnp.ndarray
     params: Dict[str, Any]
     opt_state: Any
     variables: Dict[str, Any]
-    key: jax.random.PRNGKey
+    key: jax.Array
 
     @property
     def model_vars(self):
@@ -298,7 +300,7 @@ class TrainState:
     @classmethod
     def from_checkpoint(cls, ckpt, opt_state, key):
         return cls(
-            step=ckpt.get("step", 0),
+            step=ckpt.get("step", jnp.zeros((), dtype=jnp.int32)),
             params=ckpt["params"],
             opt_state=opt_state,
             variables=ckpt.get("variables", {}),
@@ -379,8 +381,9 @@ def train_step(
         new_opt_state = state.opt_state
         new_variables = state.variables
 
-    new_state = TrainState(
-        step=state.step + 1 if training else state.step,
+    new_step = state.step + 1 if training else state.step
+    new_state = state.replace(
+        step=new_step,
         params=new_params,
         opt_state=new_opt_state,
         variables=new_variables,
@@ -406,7 +409,7 @@ def _find_latest(save_dir: Path) -> int:
 
 
 def _save(state: TrainState, checkpointer, save_dir: Path, keep_n: int, final: bool = False):
-    step = state.step
+    step = int(state.step)
     ckpt_dir = str(save_dir / f"step_{step}")
 
     checkpointer.save(ckpt_dir, args=ocp.args.StandardSave(state.to_checkpoint()))
@@ -634,13 +637,18 @@ def main(args: argparse.Namespace):
         )
         state = TrainState.from_checkpoint(restored, opt_state, key)
         # Re-shard restored leaves onto the mesh (Orbax may return host arrays)
-        state.params = jax.device_put(state.params, repl_sharding)
-        state.variables = jax.device_put(state.variables, repl_sharding)
-        state.opt_state = jax.device_put(state.opt_state, repl_sharding)
+        state = state.replace(
+            params=jax.device_put(state.params, repl_sharding),
+            variables=jax.device_put(state.variables, repl_sharding),
+            opt_state=jax.device_put(state.opt_state, repl_sharding),
+        )
     else:
         print("Starting fresh training")
-        state = TrainState(step=0, params=params, opt_state=opt_state,
-                           variables=moe_vars, key=key)
+        state = TrainState(
+            step=jnp.zeros((), dtype=jnp.int32),
+            params=params, opt_state=opt_state,
+            variables=moe_vars, key=key,
+        )
 
     # ---- DataLoader ----
     tokenizer = TiktokenTokenizer(args.tiktoken_encoding)
@@ -654,7 +662,7 @@ def main(args: argparse.Namespace):
     save_every = args.save_every
     history = []
 
-    pbar = tqdm(total=total_steps, initial=state.step, desc="steps")
+    pbar = tqdm(total=total_steps, initial=int(state.step), desc="steps")
     step_t0 = time.time()
     running_loss = 0.0
     running_aux = 0.0
