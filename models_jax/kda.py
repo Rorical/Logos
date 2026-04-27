@@ -145,8 +145,7 @@ def _kda_chunk_scan(
         state_update = jnp.einsum("bhck,bhcv->bhkv", u_mat[:, :, n], delta)
         S = W[:, :, n, -1, None] * (S + state_update)
 
-        if do_snapshots and (n + 1) % chunks_per_snapshot == 0:
-            snap_idx = (n + 1) // chunks_per_snapshot - 1
+        if do_snapshots:
             Bx, Hx, Kx, Vx = S.shape
             flat = S.reshape(Bx, Hx, Kx * Vx).astype(jnp.float32)
             rrms = jax.lax.rsqrt(
@@ -154,7 +153,15 @@ def _kda_chunk_scan(
             )
             flat = flat * rrms * compressor_norm_w.astype(jnp.float32)
             latent = (flat @ compressor_down_k.astype(jnp.float32)).astype(orig_dtype)
-            snap_latents = snap_latents.at[:, snap_idx].set(latent)
+
+            is_snap_step = (n + 1) % chunks_per_snapshot == 0
+            snap_idx = (n + 1) // chunks_per_snapshot - 1
+            snap_latents = jax.lax.cond(
+                is_snap_step,
+                lambda sl: sl.at[:, snap_idx].set(latent),
+                lambda sl: sl,
+                snap_latents,
+            )
 
         return (S, outputs, snap_latents)
 
