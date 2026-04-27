@@ -282,14 +282,17 @@ class LogosTransformer(nn.Module):
         blocks = blocks + [partial]
         partial = zero_partial()
 
-        # Body (looped)
+        # Body (looped) — instantiate once, call num_loops times for weight sharing
         body_offset = cfg.num_entry_layers
+        body_blocks = [
+            LogosTransformerBlock(
+                config=cfg, layer_idx=body_offset + i,
+                num_loops=cfg.num_loops, name=f"body_{i}",
+            )
+            for i in range(cfg.num_body_layers)
+        ]
         for loop_idx in range(cfg.num_loops):
-            for i in range(cfg.num_body_layers):
-                block = LogosTransformerBlock(
-                    config=cfg, layer_idx=body_offset + i,
-                    num_loops=cfg.num_loops, name=f"body_{i}",
-                )
+            for i, block in enumerate(body_blocks):
                 partial, l_aux, l_topk = block(
                     blocks, partial,
                     attention_mask=attention_mask,
