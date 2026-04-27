@@ -30,16 +30,15 @@ def _causal_depthwise_conv1d(
     pad = K - 1
     x_pad = jnp.pad(x_t, ((0, 0), (0, 0), (pad, 0)))
 
-    x_flat = x_pad.reshape(B * D, 1, T + pad)
     w_flat = weight.reshape(D, 1, K)
 
     y = jax.lax.conv_general_dilated(
-        x_flat, w_flat,
+        x_pad, w_flat,
         window_strides=(1,), padding="VALID",
         dimension_numbers=("NCH", "OIH", "NCH"),
         feature_group_count=D,
     )
-    y = y.reshape(B, D, T).transpose(0, 2, 1)
+    y = y.transpose(0, 2, 1)
 
     if activation == "silu":
         y = jax.nn.silu(y)
