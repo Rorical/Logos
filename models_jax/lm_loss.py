@@ -33,24 +33,34 @@ def chunked_linear_cross_entropy(
     targets_flat = targets.reshape(-1)
 
     valid = targets_flat != ignore_index
-    safe_targets = jnp.clip(targets_flat, 0)
-    count = valid.sum().astype(jnp.float32).clip(1.0)
+    safe_targets = jnp.clip(targets_flat, min=0)
+    count = valid.sum().astype(jnp.float32).clip(min=1.0)
 
-    def chunk_fn(start, _):
-        end = min(start + chunk_size, hidden_flat.shape[0])
-        h_chunk = hidden_flat[start:end]
-        t_chunk = safe_targets[start:end]
-        v_chunk = valid[start:end]
+    N = hidden_flat.shape[0]
+    pad = (-N) % chunk_size
+    if pad > 0:
+        hidden_flat = jnp.pad(hidden_flat, ((0, pad), (0, 0)))
+        safe_targets = jnp.pad(safe_targets, (0, pad))
+        valid = jnp.pad(valid, (0, pad))  # bool pads with False -> zero contribution
 
-        logits = (h_chunk @ weight.T).astype(jnp.float32)
+    n_chunks = (N + pad) // chunk_size
+    h_chunked = hidden_flat.reshape(n_chunks, chunk_size, -1)
+    t_chunked = safe_targets.reshape(n_chunks, chunk_size)
+    v_chunked = valid.reshape(n_chunks, chunk_size).astype(jnp.float32)
+
+    def per_chunk(carry, inputs):
+        h, t, v = inputs
+        logits = (h @ weight.T).astype(jnp.float32)
         log_z = jax.nn.logsumexp(logits, axis=-1)
-        target_logits = logits[jnp.arange(end - start), t_chunk]
-        chunk_loss = ((log_z - target_logits) * v_chunk).sum()
-        return chunk_loss
+        target_logits = jnp.take_along_axis(logits, t[:, None], axis=-1).squeeze(-1)
+        chunk_loss = ((log_z - target_logits) * v).sum()
+        return carry + chunk_loss, None
 
-    starts = jnp.arange(0, hidden_flat.shape[0], chunk_size)
-    losses = jax.lax.map(lambda s: chunk_fn(s, None), starts)
-    return losses.sum() / count
+    total, _ = jax.lax.scan(
+        per_chunk, jnp.zeros((), dtype=jnp.float32),
+        (h_chunked, t_chunked, v_chunked),
+    )
+    return total / count
 
 
 def standard_lm_cross_entropy(
@@ -73,5 +83,5 @@ def standard_lm_cross_entropy(
         flat_logits, flat_labels_safe
     )
     loss_sum = (per_token_loss * valid).sum()
-    count = valid.sum().clip(1)
+    count = valid.sum().clip(min=1)
     return loss_sum / count

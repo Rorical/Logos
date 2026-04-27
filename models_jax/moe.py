@@ -141,30 +141,26 @@ class MoELayer(nn.Module):
 
         valid = slot_indices < C
 
-        # Scatter to (E, C, D): use 1D scatter for unique (expert*C + slot) pairs
-        # Only scatter valid slots (< C)
-        valid_exp = jnp.where(valid, sorted_exp, 0)
-        valid_slot = jnp.where(valid, slot_indices, 0)
-        flat_idx = valid_exp * C + valid_slot
+        # Scatter into (E, C+1, ...) with slot=C as a sentinel column for invalid
+        # (over-capacity) tokens. Invalids share that column, so duplicate writes
+        # land there and are sliced off before the expert call. Valid (expert,
+        # slot) pairs are unique by construction, so .set is well-defined.
+        safe_slot = jnp.where(valid, slot_indices, C)
+        flat_idx = sorted_exp * (C + 1) + safe_slot
 
         sorted_x = x_flat[sorted_tok]
 
-        expert_in = jnp.zeros((E * C, D), dtype=dtype)
-        expert_gate = jnp.zeros((E * C,), dtype=dtype)
-        expert_mask = jnp.zeros((E * C,), dtype=jnp.bool_)
-
-        # Scatter: use add for safety (no duplicate handling needed since slots are unique)
-        expert_in = expert_in.at[flat_idx].add(
-            jnp.where(valid[:, None], sorted_x, 0.0)
+        expert_in = jnp.zeros((E * (C + 1), D), dtype=dtype).at[flat_idx].set(sorted_x)
+        expert_gate = jnp.zeros((E * (C + 1),), dtype=dtype).at[flat_idx].set(sorted_gate)
+        expert_mask = jnp.zeros((E * (C + 1),), dtype=jnp.bool_).at[flat_idx].set(valid)
+        tok_lookup = jnp.full((E * (C + 1),), N, dtype=jnp.int32).at[flat_idx].set(
+            jnp.where(valid, sorted_tok, N)
         )
-        expert_gate = expert_gate.at[flat_idx].add(
-            jnp.where(valid, sorted_gate, 0.0)
-        )
-        expert_mask = expert_mask.at[flat_idx].set(valid)
 
-        expert_in = expert_in.reshape(E, C, D)
-        expert_gate = expert_gate.reshape(E, C)
-        expert_mask = expert_mask.reshape(E, C)
+        expert_in = expert_in.reshape(E, C + 1, D)[:, :C]
+        expert_gate = expert_gate.reshape(E, C + 1)[:, :C]
+        expert_mask = expert_mask.reshape(E, C + 1)[:, :C]
+        tok_lookup = tok_lookup.reshape(E, C + 1)[:, :C]
 
         expert_out = self._sparse(expert_in, deterministic=deterministic)
 
@@ -172,13 +168,6 @@ class MoELayer(nn.Module):
         gated = expert_out * expert_gate[..., None]
         gated_flat = gated.reshape(E * C, D)
         mask_flat = expert_mask.reshape(-1)
-
-        # Map each (e, c) pair back to its token
-        # Build lookup: for each flat positions, which token does it belong to
-        tok_lookup = jnp.full((E, C), N, dtype=jnp.int32)
-        tok_lookup = tok_lookup.at[valid_exp, valid_slot].set(
-            jnp.where(valid, sorted_tok, N)
-        )
         tok_flat = tok_lookup.reshape(-1)
 
         # Scatter to output: sum contributions per token
