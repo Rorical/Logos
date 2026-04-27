@@ -42,18 +42,97 @@ class ResidualConfig(BaselineConfig):
             )
 
 
+def _block_residual_softmax_sum(
+    values: torch.Tensor,
+    logits: torch.Tensor,
+) -> torch.Tensor:
+    """``softmax(logits, dim=0) * values`` summed along the depth axis."""
+    weights = torch.softmax(logits.float(), dim=0).to(values.dtype)
+    return torch.sum(weights * values, dim=0)
+
+
+# Opaque op so ``torch.compile`` doesn't fuse softmax_backward with the
+# upstream stack / RMSNorm / dot-product chain. On Ada-class consumer
+# GPUs (RTX PRO 6000 Blackwell, sm_120; ~99 KB SMEM/SM) Inductor
+# materialises the persistent-reduction fused backward at >128 KB SMEM
+# and fails to compile. Routing through a custom_op gives Dynamo a
+# fusion boundary so each piece (softmax_backward, weighted_sum_backward,
+# RMSNorm_backward) compiles into its own kernel that fits in SMEM.
+@torch.library.custom_op(
+    "logos::block_residual_softmax_sum", mutates_args=(),
+)
+def _block_residual_softmax_sum_op(
+    values: torch.Tensor, logits: torch.Tensor,
+) -> torch.Tensor:
+    return _block_residual_softmax_sum(values, logits)
+
+
+@_block_residual_softmax_sum_op.register_fake
+def _block_residual_softmax_sum_fake(
+    values: torch.Tensor, logits: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(
+        values.shape[1:], dtype=values.dtype, device=values.device,
+    )
+
+
+def _block_residual_softmax_sum_setup_context(ctx, inputs, output):
+    values, logits = inputs
+    ctx.save_for_backward(values, logits)
+
+
+def _block_residual_softmax_sum_backward(ctx, grad_output):
+    values, logits = ctx.saved_tensors
+    # Recompute the small forward under autograd to extract per-input
+    # gradients. Each contributing op (softmax, mul, sum) becomes its own
+    # eager kernel — the whole point of routing through this opaque op.
+    v_d = values.detach().requires_grad_(values.requires_grad)
+    l_d = logits.detach().requires_grad_(logits.requires_grad)
+    with torch.enable_grad():
+        out = _block_residual_softmax_sum(v_d, l_d)
+    grads = torch.autograd.grad(
+        outputs=out, inputs=[v_d, l_d],
+        grad_outputs=grad_output, allow_unused=True,
+    )
+    return grads[0], grads[1]
+
+
+_block_residual_softmax_sum_op.register_autograd(
+    _block_residual_softmax_sum_backward,
+    setup_context=_block_residual_softmax_sum_setup_context,
+)
+
+
 class BlockAttentionResidual(nn.Module):
     """Depth-wise softmax over completed block states + the current partial.
 
     ``proj`` is zero-initialised so the layer starts as a uniform average,
     matching a standard residual sum in expectation. Softmax runs in fp32.
+
+    ``isolate_softmax`` routes the depth-softmax + weighted-sum step
+    through an opaque custom_op so ``torch.compile`` can't fuse it with
+    the upstream stack / RMSNorm / dot-product chain. Set this on
+    SMEM-constrained GPUs where Inductor's persistent-reduction fused
+    backward exceeds the per-block shared-memory cap.
     """
 
-    def __init__(self, d_model: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        d_model: int,
+        eps: float = 1e-6,
+        isolate_softmax: bool = False,
+    ):
         super().__init__()
         self.norm = RMSNorm(d_model, eps=eps)
-        self.proj = nn.Linear(d_model, 1, bias=False)
-        nn.init.zeros_(self.proj.weight)
+        # 1D Parameter rather than ``nn.Linear(d_model, 1, bias=False)``.
+        # torch.compile's captured-graph backward strips the leading 1 dim
+        # off the gradient of a ``(1, d_model)`` Linear weight, then fails
+        # autograd's shape contract:
+        #   "got [d_model] but expected shape compatible with [1, d_model]".
+        # A 1D parameter sidesteps the bug — gradient and expected shape
+        # are both ``(d_model,)`` with no singleton to mishandle.
+        self.proj = nn.Parameter(torch.zeros(d_model))
+        self.isolate_softmax = bool(isolate_softmax)
 
     def forward(
         self,
@@ -65,9 +144,12 @@ class BlockAttentionResidual(nn.Module):
 
         values = torch.stack(blocks + [partial_block], dim=0)
         keys = self.norm(values)
-        logits = self.proj(keys).squeeze(-1)
-        weights = torch.softmax(logits.float(), dim=0).to(values.dtype)
-        return torch.sum(weights.unsqueeze(-1) * values, dim=0)
+        # Dot keys against a 1D weight; keepdim=True so the broadcast
+        # against ``values`` doesn't need a separate unsqueeze.
+        logits = (keys * self.proj).sum(dim=-1, keepdim=True)  # [N, B, T, 1]
+        if self.isolate_softmax:
+            return _block_residual_softmax_sum_op(values, logits)
+        return _block_residual_softmax_sum(values, logits)
 
 
 class ResidualTransformerBlock(nn.Module):
@@ -84,8 +166,13 @@ class ResidualTransformerBlock(nn.Module):
         else:
             self.ffn = SwiGLU(config.d_model, config.d_ff, config.dropout)
 
-        self.attn_res = BlockAttentionResidual(config.d_model, eps=config.norm_eps)
-        self.ffn_res = BlockAttentionResidual(config.d_model, eps=config.norm_eps)
+        isolate = getattr(config, "block_residual_isolate_softmax", False)
+        self.attn_res = BlockAttentionResidual(
+            config.d_model, eps=config.norm_eps, isolate_softmax=isolate,
+        )
+        self.ffn_res = BlockAttentionResidual(
+            config.d_model, eps=config.norm_eps, isolate_softmax=isolate,
+        )
 
     def forward(
         self,
@@ -105,7 +192,7 @@ class ResidualTransformerBlock(nn.Module):
             return blocks, partial_block, aux_loss, topk_indices
         else:
             partial_block = partial_block + self.ffn(self.ffn_norm(h))
-            zero = torch.tensor(0.0, device=partial_block.device, dtype=partial_block.dtype)
+            zero = torch.zeros((), device=partial_block.device, dtype=partial_block.dtype)
             return blocks, partial_block, zero, None
 
 
@@ -123,7 +210,10 @@ class ResidualTransformer(nn.Module):
             ResidualTransformerBlock(config) for _ in range(config.num_layers)
         ])
 
-        self.final_res = BlockAttentionResidual(config.d_model, eps=config.norm_eps)
+        self.final_res = BlockAttentionResidual(
+            config.d_model, eps=config.norm_eps,
+            isolate_softmax=getattr(config, "block_residual_isolate_softmax", False),
+        )
         self.final_norm = RMSNorm(config.d_model, eps=config.norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight
@@ -141,7 +231,7 @@ class ResidualTransformer(nn.Module):
 
         for module in self.modules():
             if isinstance(module, BlockAttentionResidual):
-                nn.init.zeros_(module.proj.weight)
+                nn.init.zeros_(module.proj)
 
     def _is_block_boundary(self, layer_idx: int) -> bool:
         return layer_idx > 0 and (layer_idx % self.layers_per_block == 0)
@@ -160,7 +250,7 @@ class ResidualTransformer(nn.Module):
         blocks: List[torch.Tensor] = [x]
         partial_block = torch.zeros_like(x)
 
-        aux_loss = torch.tensor(0.0, device=input_ids.device, dtype=x.dtype)
+        aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []
 
         for layer_idx, layer in enumerate(self.layers):
@@ -184,16 +274,16 @@ class ResidualTransformer(nn.Module):
 
         loss: Optional[torch.Tensor] = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            if (shift_labels != -100).any():
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100,
-                )
-            else:
-                loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+            shift_logits = logits[..., :-1, :]
+            shift_labels = labels[..., 1:]
+            flat_labels = shift_labels.reshape(-1)
+            loss_sum = F.cross_entropy(
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                flat_labels,
+                ignore_index=-100,
+                reduction="sum",
+            )
+            loss = loss_sum / (flat_labels != -100).sum().clamp_min(1)
 
         return {
             "logits": logits,

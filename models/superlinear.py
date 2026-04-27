@@ -469,7 +469,11 @@ class SnapshotRetrieval(nn.Module):
             weights = torch.where(all_masked, torch.zeros_like(weights), weights)
 
         out = torch.einsum("bhtn,bhnd->bhtd", weights, v)
-        out = out.transpose(1, 2).contiguous().view(B, T, H * Dh)
+        # ``reshape`` skips the layout-fixing copy when the post-transpose
+        # strides happen to permit a view; ``contiguous().view(...)`` always
+        # copied. Compile can additionally fold the reshape into the
+        # surrounding matmul fusion.
+        out = out.transpose(1, 2).reshape(B, T, H * Dh)
 
         gate = torch.sigmoid(self.gate_up(self.gate_down(x)))
         out = out * gate
@@ -730,7 +734,7 @@ class SuperLinearTransformerBlock(nn.Module):
             return x, aux_loss, topk_indices
         else:
             x = x + self.ffn(self.ffn_norm(x))
-            return x, torch.tensor(0.0, device=x.device, dtype=x.dtype), None
+            return x, torch.zeros((), device=x.device, dtype=x.dtype), None
 
 
 class SuperLinearTransformer(nn.Module):
@@ -777,7 +781,7 @@ class SuperLinearTransformer(nn.Module):
         x = self.token_emb(input_ids)
         x = self.dropout(x)
 
-        aux_loss = torch.tensor(0.0, device=input_ids.device, dtype=x.dtype)
+        aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []
         for i, layer in enumerate(self.layers):
             layer_cache = caches[i] if caches is not None else None
@@ -793,16 +797,16 @@ class SuperLinearTransformer(nn.Module):
 
         loss: Optional[torch.Tensor] = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            if (shift_labels != -100).any():
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100,
-                )
-            else:
-                loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+            shift_logits = logits[..., :-1, :]
+            shift_labels = labels[..., 1:]
+            flat_labels = shift_labels.reshape(-1)
+            loss_sum = F.cross_entropy(
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                flat_labels,
+                ignore_index=-100,
+                reduction="sum",
+            )
+            loss = loss_sum / (flat_labels != -100).sum().clamp_min(1)
 
         return {
             "logits": logits,

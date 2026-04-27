@@ -43,13 +43,49 @@ class HybridConfig(SuperLinearConfig):
             )
 
 
+try:
+    from torch.nn.attention.flex_attention import (
+        flex_attention as _flex_attention,
+        create_block_mask as _create_block_mask,
+    )
+    _HAS_FLEX = True
+    # Without an explicit torch.compile wrapper FlexAttention falls back to an
+    # eager implementation that materializes the full scores matrix and warns
+    # on every call. Compiling once at import time gives the fused kernel and
+    # caches recompiles per (shape, score_mod, block_mask) signature.
+    _flex_attention_fused = torch.compile(_flex_attention, dynamic=False)
+except ImportError:
+    _HAS_FLEX = False
+    _flex_attention_fused = None
+
+
 class LocalAttention(Attention):
-    """Causal sliding-window MHA. Inherits the full attention pipeline from
-    :class:`baseline.Attention` and only overrides ``_build_mask``."""
+    """Causal sliding-window MHA.
+
+    On CUDA we route through :func:`torch.nn.attention.flex_attention.flex_attention`
+    with a compiled sliding-window ``BlockMask``, so attention is sparse:
+    out-of-window key blocks are skipped entirely instead of being computed
+    and then masked. This is roughly ``seq_len / window`` × cheaper than
+    the dense-and-mask approach on long contexts.
+
+    Attention-sink is preserved by prepending a single virtual key/value
+    pair at position 0 (zero value vector) and using ``score_mod`` to
+    override the pre-softmax score of that slot to the per-head learnable
+    ``sink_logit``. This matches :func:`baseline.softmax_with_sink` exactly:
+    the sink contributes mass to the softmax denominator while contributing
+    zero to the output, biasing other weights to sum to ≤ 1.
+
+    A dense fallback (parent's ``_build_mask`` + ``F.scaled_dot_product_attention``)
+    runs on CPU and on PyTorch builds without FlexAttention so smoke tests
+    work everywhere.
+    """
 
     def __init__(self, config: HybridConfig):
         super().__init__(config)
         self.window = config.swa_window
+        # BlockMask is shape-bound (Q_LEN, KV_LEN) but parameter-free, so we
+        # can build once per (seq_len, has_sink, is_causal, device) and reuse.
+        self._block_mask_cache: Dict[Tuple[int, bool, bool, str], Any] = {}
 
     def _build_mask(
         self,
@@ -59,6 +95,7 @@ class LocalAttention(Attention):
         attention_mask: Optional[torch.Tensor],
         is_causal: bool,
     ) -> Optional[torch.Tensor]:
+        # Used only by the dense CPU fallback in ``forward``.
         idx = torch.arange(seq_len, device=device)
         rel = idx.unsqueeze(0) - idx.unsqueeze(1)
         if is_causal:
@@ -73,6 +110,106 @@ class LocalAttention(Attention):
             mask = mask & key_mask
 
         return mask
+
+    def _get_block_mask(
+        self,
+        seq_len: int,
+        has_sink: bool,
+        is_causal: bool,
+        device: torch.device,
+    ):
+        key = (seq_len, has_sink, is_causal, str(device))
+        bm = self._block_mask_cache.get(key)
+        if bm is not None:
+            return bm
+
+        window = self.window
+        if has_sink:
+            kv_len = seq_len + 1
+            if is_causal:
+                def mask_mod(b, h, q_idx, kv_idx):
+                    is_sink = kv_idx == 0
+                    real_kv = kv_idx - 1
+                    in_window = (q_idx >= real_kv) & (q_idx - real_kv < window)
+                    return is_sink | in_window
+            else:
+                def mask_mod(b, h, q_idx, kv_idx):
+                    is_sink = kv_idx == 0
+                    real_kv = kv_idx - 1
+                    in_window = (real_kv - q_idx).abs() < window
+                    return is_sink | in_window
+        else:
+            kv_len = seq_len
+            if is_causal:
+                def mask_mod(b, h, q_idx, kv_idx):
+                    return (q_idx >= kv_idx) & (q_idx - kv_idx < window)
+            else:
+                def mask_mod(b, h, q_idx, kv_idx):
+                    return (q_idx - kv_idx).abs() < window
+
+        bm = _create_block_mask(
+            mask_mod, B=None, H=None, Q_LEN=seq_len, KV_LEN=kv_len,
+            device=device,
+        )
+        self._block_mask_cache[key] = bm
+        return bm
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        is_causal: bool = True,
+    ) -> torch.Tensor:
+        # The optimized FlexAttention block mask is sequence-structural; it
+        # does not include per-example padding. When a caller supplies an
+        # attention_mask, use the dense parent path so padded keys are masked
+        # correctly. The pretraining script passes ``None`` for its packed
+        # fixed-length batches, preserving the sparse CUDA path there.
+        if attention_mask is not None or not _HAS_FLEX or not x.is_cuda:
+            return super().forward(x, attention_mask=attention_mask, is_causal=is_causal)
+
+        batch, seq_len, _ = x.shape
+        q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(batch, seq_len, self.num_heads, self.head_dim)
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        q = self._apply_rope(q, seq_len)
+        k = self._apply_rope(k, seq_len)
+
+        has_sink = self.attention_sink
+        if has_sink:
+            sink_k = torch.zeros(
+                batch, self.num_heads, 1, self.head_dim,
+                device=q.device, dtype=q.dtype,
+            )
+            sink_v = torch.zeros_like(sink_k)
+            k = torch.cat([sink_k, k], dim=2)
+            v = torch.cat([sink_v, v], dim=2)
+            sink_logit = self.sink_logit
+
+            def score_mod(score, b, h, q_idx, kv_idx):
+                # The dot-product against the zero sink key is 0; replace
+                # it with the per-head learnable logit so the sink only
+                # affects the softmax denominator.
+                sink = sink_logit[h].to(score.dtype)
+                return torch.where(kv_idx == 0, sink, score)
+        else:
+            score_mod = None
+
+        block_mask = self._get_block_mask(
+            seq_len, has_sink=has_sink, is_causal=is_causal, device=q.device,
+        )
+        out = _flex_attention_fused(
+            q, k, v, score_mod=score_mod, block_mask=block_mask,
+        )
+
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.d_model)
+        return self.out_proj(out)
 
 
 class HybridTransformerBlock(nn.Module):
@@ -159,7 +296,7 @@ class HybridTransformerBlock(nn.Module):
             return x, aux_loss, topk_indices
         else:
             x = x + self.ffn(self.ffn_norm(x))
-            zero = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+            zero = torch.zeros((), device=x.device, dtype=x.dtype)
             return x, zero, None
 
 
@@ -205,7 +342,7 @@ class HybridTransformer(nn.Module):
         x = self.token_emb(input_ids)
         x = self.dropout(x)
 
-        aux_loss = torch.tensor(0.0, device=input_ids.device, dtype=x.dtype)
+        aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []
         for i, layer in enumerate(self.layers):
             # SWA layers don't read per-layer caches.
@@ -226,16 +363,16 @@ class HybridTransformer(nn.Module):
 
         loss: Optional[torch.Tensor] = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            if (shift_labels != -100).any():
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100,
-                )
-            else:
-                loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+            shift_logits = logits[..., :-1, :]
+            shift_labels = labels[..., 1:]
+            flat_labels = shift_labels.reshape(-1)
+            loss_sum = F.cross_entropy(
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                flat_labels,
+                ignore_index=-100,
+                reduction="sum",
+            )
+            loss = loss_sum / (flat_labels != -100).sum().clamp_min(1)
 
         return {
             "logits": logits,

@@ -42,14 +42,19 @@ class TiktokenTokenizer:
         self,
         text: str,
         allowed_special: Union[str, set, None] = None,
-        disallowed_special: Union[str, set] = "all",
+        disallowed_special: Union[str, set] = (),
     ) -> List[int]:
-        """Encode a single string to a list of token ids."""
+        """Encode a single string to token ids.
+
+        Literal special-token strings in raw corpora are treated as normal
+        text by default. Pass ``allowed_special="all"`` or a specific token
+        set when those strings should become special token ids.
+        """
         # tiktoken expects allowed_special as "all" or a set of strings
         if allowed_special is None:
             allowed_special = set()
         elif isinstance(allowed_special, str) and allowed_special != "all":
-            allowed_special = set()
+            allowed_special = {allowed_special}
         return self.encoding.encode(
             text, allowed_special=allowed_special, disallowed_special=disallowed_special
         )

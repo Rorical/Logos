@@ -1,7 +1,6 @@
 """Linear (Kimi Delta Attention) decoder-only transformer.
 
-Pure-PyTorch chunkwise-parallel KDA scan; no fla/Triton kernels required.
-Numerically matches ``fla.ops.kda.naive.naive_recurrent_kda``.
+Pure-PyTorch chunkwise-parallel KDA scan.
 """
 
 import math
@@ -19,6 +18,7 @@ from models.baseline import (
     RMSNorm,
     SwiGLU,
     MoELayer,
+    _validate_moe_config,
     count_parameters,
     model_summary,
 )
@@ -282,6 +282,18 @@ class LinearConfig(BaselineConfig):
     def __post_init__(self):
         if self.d_model % self.num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
+        if self.partial_rope_dim is not None:
+            if self.partial_rope_dim % 2 != 0:
+                raise ValueError(
+                    f"partial_rope_dim ({self.partial_rope_dim}) must be even"
+                )
+        if self.head_dim < 1:
+            raise ValueError("head_dim must be >= 1")
+        if self.chunk_size < 1:
+            raise ValueError("chunk_size must be >= 1")
+        if self.conv_size < 1:
+            raise ValueError("conv_size must be >= 1")
+        _validate_moe_config(self)
 
 
 class KimiDeltaAttention(nn.Module):
@@ -443,7 +455,7 @@ class LinearTransformerBlock(nn.Module):
             return x, aux_loss, topk_indices
         else:
             x = x + self.ffn(self.ffn_norm(x))
-            return x, torch.tensor(0.0, device=x.device, dtype=x.dtype), None
+            return x, torch.zeros((), device=x.device, dtype=x.dtype), None
 
 
 class LinearTransformer(nn.Module):
@@ -484,7 +496,7 @@ class LinearTransformer(nn.Module):
         x = self.token_emb(input_ids)
         x = self.dropout(x)
 
-        aux_loss = torch.tensor(0.0, device=input_ids.device, dtype=x.dtype)
+        aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []
         for i, layer in enumerate(self.layers):
             layer_cache = caches[i] if caches is not None else None
@@ -500,16 +512,16 @@ class LinearTransformer(nn.Module):
 
         loss: Optional[torch.Tensor] = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            if (shift_labels != -100).any():
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100,
-                )
-            else:
-                loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+            shift_logits = logits[..., :-1, :]
+            shift_labels = labels[..., 1:]
+            flat_labels = shift_labels.reshape(-1)
+            loss_sum = F.cross_entropy(
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                flat_labels,
+                ignore_index=-100,
+                reduction="sum",
+            )
+            loss = loss_sum / (flat_labels != -100).sum().clamp_min(1)
 
         return {
             "logits": logits,

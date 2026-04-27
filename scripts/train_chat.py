@@ -70,6 +70,9 @@ def build_model(args: argparse.Namespace, vocab_size: int):
         expert_d_ff=args.expert_d_ff,
         bias_update_rate=args.bias_update_rate,
         capacity_factor=args.capacity_factor,
+        block_residual_isolate_softmax=getattr(
+            args, "block_residual_isolate_softmax", False,
+        ),
     )
 
     if args.model == "linear":
@@ -167,8 +170,9 @@ def collate_fn(batch):
 class _Dataset(torch.utils.data.Dataset):
     """Simple wrapper for a HuggingFace dataset with pre-tokenized columns.
     Defined at module level so Windows spawn multiprocessing can pickle it."""
-    def __init__(self, hf_dataset):
+    def __init__(self, hf_dataset, pad_token_id: int):
         self.data = hf_dataset
+        self.pad_token_id = pad_token_id
 
     def __len__(self):
         return len(self.data)
@@ -179,13 +183,19 @@ class _Dataset(torch.utils.data.Dataset):
             "input_ids": item["input_ids"],
             "attention_mask": item["attention_mask"],
             "labels": item["labels"],
-            "pad_token_id": 100257,
+            "pad_token_id": self.pad_token_id,
         }
 
 
-def create_dataloader(dataset, batch_size: int, shuffle: bool = True, num_workers: int = 0):
+def create_dataloader(
+    dataset,
+    batch_size: int,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    pad_token_id: int = 100257,
+):
     return DataLoader(
-        _Dataset(dataset),
+        _Dataset(dataset, pad_token_id=pad_token_id),
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn,
@@ -377,6 +387,12 @@ def main():
     parser.add_argument("--bias-update-rate", type=float, default=0.01)
     parser.add_argument("--capacity-factor", type=float, default=2.0,
                         help="Capacity factor for static-shape MoE dispatch (>=1.0)")
+    parser.add_argument("--block-residual-isolate-softmax", action="store_true",
+                        help="Route the BlockAttentionResidual depth-softmax "
+                             "+ weighted-sum through an opaque custom_op so "
+                             "torch.compile doesn't fuse softmax_backward "
+                             "with the upstream stack/RMSNorm chain. Set on "
+                             "Ada-class GPUs hitting Inductor SMEM caps.")
 
     # --- KDA / linear-model-specific ----------------------------------------
     parser.add_argument("--head-dim", type=int, default=None,
@@ -425,7 +441,7 @@ def main():
     parser.add_argument("--cache-dir", type=str, default="cache")
     parser.add_argument("--compile", action="store_true",
                         help="Wrap model with torch.compile for static-graph execution "
-                             "and fused Triton kernels (1.5-2x speedup after warmup)")
+                             "(1.5-2x speedup after warmup)")
     parser.add_argument("--compile-mode", type=str, default="default",
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode. 'reduce-overhead' uses CUDA graphs; "
@@ -505,10 +521,12 @@ def main():
     print(f"  validation examples: {len(dataset['validation'])}")
 
     train_loader = create_dataloader(
-        dataset["train"], args.batch_size, shuffle=True, num_workers=args.num_workers
+        dataset["train"], args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pad_token_id=tokenizer.pad_token_id,
     )
     val_loader = create_dataloader(
-        dataset["validation"], args.batch_size, shuffle=False, num_workers=args.num_workers
+        dataset["validation"], args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pad_token_id=tokenizer.pad_token_id,
     )
 
     # ------------------------------------------------------------------ #

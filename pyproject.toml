@@ -15,6 +15,10 @@ dependencies = [
     "einops>=0.8.2",
 ]
 
+[project.optional-dependencies]
+# Observability is opt-in: only required when training with --wandb.
+wandb = ["wandb>=0.18"]
+
 [tool.uv]
 find-links = [
     "https://download.pytorch.org/whl/cu130",

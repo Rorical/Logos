@@ -89,7 +89,7 @@ class RecursiveBlock(nn.Module):
         loop_idx: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Optional[torch.Tensor]]]:
         x = h + e
-        aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        aux_loss = torch.zeros((), device=x.device, dtype=x.dtype)
         topk_list: List[Optional[torch.Tensor]] = []
         for block in self.blocks:
             x, block_aux, block_topk = block(
@@ -147,7 +147,7 @@ class RecursiveTransformer(nn.Module):
         x = self.token_emb(input_ids)
         x = self.dropout(x)
 
-        aux_loss = torch.tensor(0.0, device=input_ids.device, dtype=x.dtype)
+        aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []
 
         for layer in self.entry:
@@ -183,16 +183,16 @@ class RecursiveTransformer(nn.Module):
 
         loss: Optional[torch.Tensor] = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            if (shift_labels != -100).any():
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100,
-                )
-            else:
-                loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+            shift_logits = logits[..., :-1, :]
+            shift_labels = labels[..., 1:]
+            flat_labels = shift_labels.reshape(-1)
+            loss_sum = F.cross_entropy(
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                flat_labels,
+                ignore_index=-100,
+                reduction="sum",
+            )
+            loss = loss_sum / (flat_labels != -100).sum().clamp_min(1)
 
         return {
             "logits": logits,

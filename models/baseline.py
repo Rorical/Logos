@@ -8,6 +8,44 @@ from typing import List, Optional, Tuple, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+
+
+def _maybe_all_reduce_load(load: torch.Tensor) -> torch.Tensor:
+    """Sum a per-expert load tensor across DDP ranks in place. No-op when
+    distributed is not initialised so single-GPU training is unchanged."""
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(load, op=dist.ReduceOp.SUM)
+    return load
+
+
+def _expert_load_from_topk(
+    topk_indices: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """Count top-k expert assignments without materialising one-hot tensors."""
+    return torch.bincount(
+        topk_indices.reshape(-1),
+        minlength=num_experts,
+    ).to(torch.float32)
+
+
+def _validate_moe_config(config) -> None:
+    if not config.use_moe:
+        return
+    if config.num_shared_experts < 1:
+        raise ValueError("num_shared_experts must be >= 1 when use_moe=True")
+    if config.num_sparse_experts < 1:
+        raise ValueError("num_sparse_experts must be >= 1 when use_moe=True")
+    if not (1 <= config.top_k <= config.num_sparse_experts):
+        raise ValueError(
+            f"top_k ({config.top_k}) must be in [1, num_sparse_experts="
+            f"{config.num_sparse_experts}] when use_moe=True"
+        )
+    if config.expert_d_ff < 1:
+        raise ValueError("expert_d_ff must be >= 1 when use_moe=True")
+    if config.capacity_factor <= 0:
+        raise ValueError("capacity_factor must be > 0 when use_moe=True")
 
 
 @dataclass
@@ -31,6 +69,9 @@ class BaselineConfig:
     expert_d_ff: int = 256
     bias_update_rate: float = 0.01
     capacity_factor: float = 2.0
+    # 0 keeps the standard full-logits CE. Positive values enable the
+    # memory-efficient chunked LM-head CE in models that support it.
+    lm_head_chunk_size: int = 0
     # Cross-loop expert-diversity weight; only acts when an MoE layer is
     # reused across loop iterations (recursive / logos body stack).
     moe_diversity_factor: float = 0.0
@@ -40,6 +81,17 @@ class BaselineConfig:
     qk_norm: bool = True
     partial_rope_dim: Optional[int] = None
     attention_sink: bool = True
+
+    # When True, route the BlockAttentionResidual depth-softmax + weighted
+    # sum through an opaque torch.library.custom_op so torch.compile can't
+    # fuse softmax_backward with the upstream stack / RMSNorm / dot-product
+    # chain. Needed on SMEM-constrained GPUs (sm_120 / Ada-class consumer
+    # cards, ~99 KB SMEM/SM) where Inductor's persistent-reduction fused
+    # backward exceeds the per-block shared-memory cap. Adds ~one graph
+    # break per BlockAttentionResidual call (~97 in Logos at default
+    # depth) — typically <2% throughput on cards where the unfused path
+    # compiles fine.
+    block_residual_isolate_softmax: bool = False
 
     def __post_init__(self):
         if self.d_model % self.num_heads != 0:
@@ -55,17 +107,16 @@ class BaselineConfig:
                 raise ValueError(
                     f"partial_rope_dim ({self.partial_rope_dim}) must be even"
                 )
+        _validate_moe_config(self)
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = x.pow(2).mean(dim=-1, keepdim=True).sqrt() + self.eps
-        return self.weight * (x / norm)
+# Fused C++ kernel (PyTorch >= 2.4) — pow+mean+rsqrt+mul in a single pass,
+# vs the previous 3-kernel python implementation. Same ``.weight`` parameter
+# so existing checkpoints load unchanged. Note that nn.RMSNorm puts eps
+# inside the sqrt (1/sqrt(mean(x^2)+eps)) where the old impl had it outside
+# (1/(sqrt(mean(x^2))+eps)) — a tiny numerical difference, not a behavior
+# change at training scale.
+RMSNorm = nn.RMSNorm
 
 
 class RotaryEmbedding(nn.Module):
@@ -121,6 +172,59 @@ class Expert(nn.Module):
         return self.ffn(x)
 
 
+class SparseExpertBank(nn.Module):
+    """Packed sparse-expert SwiGLU weights.
+
+    The master parameters stay 2D so the existing Muon parameter split still
+    picks them up. ``packed_weights`` returns zero-copy 3D views grouped by
+    expert.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        d_model: int,
+        d_ff: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.w_gate = nn.Parameter(torch.empty(num_experts * d_ff, d_model))
+        self.w_up = nn.Parameter(torch.empty(num_experts * d_ff, d_model))
+        self.w_down = nn.Parameter(torch.empty(num_experts * d_model, d_ff))
+        self.dropout = nn.Dropout(dropout)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.w_gate, mean=0.0, std=0.02)
+        nn.init.normal_(self.w_up, mean=0.0, std=0.02)
+        nn.init.normal_(self.w_down, mean=0.0, std=0.02)
+
+    def packed_weights(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            self.w_gate.view(self.num_experts, self.d_ff, self.d_model),
+            self.w_up.view(self.num_experts, self.d_ff, self.d_model),
+            self.w_down.view(self.num_experts, self.d_model, self.d_ff),
+        )
+
+    def forward_batched(self, expert_in: torch.Tensor) -> torch.Tensor:
+        """SwiGLU over a static-shape ``(E, C, d_model)`` expert-grouped batch.
+
+        Three batched GEMMs replace ``E`` Python iterations of three small
+        ``F.linear`` calls — fewer kernel launches and better SM utilisation
+        when per-expert capacity ``C`` is small.
+        """
+        w_gate, w_up, w_down = self.packed_weights()
+        h_gate = torch.bmm(expert_in, w_gate.transpose(-1, -2))
+        h_up = torch.bmm(expert_in, w_up.transpose(-1, -2))
+        hidden = F.silu(h_gate) * h_up
+        return self.dropout(torch.bmm(hidden, w_down.transpose(-1, -2)))
+
+
 class Router(nn.Module):
     def __init__(self, d_model: int, num_experts: int):
         super().__init__()
@@ -161,10 +265,12 @@ class MoELayer(nn.Module):
             Expert(config.d_model, config.expert_d_ff, config.dropout)
             for _ in range(config.num_shared_experts)
         ])
-        self.sparse_experts = nn.ModuleList([
-            Expert(config.d_model, config.expert_d_ff, config.dropout)
-            for _ in range(config.num_sparse_experts)
-        ])
+        self.sparse_experts = SparseExpertBank(
+            config.num_sparse_experts,
+            config.d_model,
+            config.expert_d_ff,
+            config.dropout,
+        )
 
     def forward(
         self,
@@ -179,10 +285,6 @@ class MoELayer(nn.Module):
         K = self.top_k
 
         router_logits = self.router(x) + self.bias[loop_idx]
-        router_probs = F.softmax(router_logits, dim=-1)
-
-        topk_probs, topk_indices = torch.topk(router_probs, K, dim=-1)
-        topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-9)
 
         shared_out = sum(expert(x) for expert in self.shared_experts) / self.num_shared_experts
 
@@ -191,17 +293,26 @@ class MoELayer(nn.Module):
 
         x_flat = x.view(-1, d_model)
 
+        router_probs = F.softmax(router_logits, dim=-1)
+
+        topk_probs, topk_indices = torch.topk(router_probs, K, dim=-1)
+        topk_probs = topk_probs / (
+            topk_probs.sum(dim=-1, keepdim=True) + 1e-9
+        )
+
         topk_indices_flat = topk_indices.view(-1)
         topk_probs_flat = topk_probs.view(-1)
-        token_ids = torch.arange(N, device=device).unsqueeze(1).expand(-1, K).reshape(-1)
+        token_ids = torch.arange(
+            N, device=device,
+        ).unsqueeze(1).expand(-1, K).reshape(-1)
 
         sorted_expert_ids, sort_idx = torch.sort(topk_indices_flat)
         sorted_token_ids = token_ids[sort_idx]
         sorted_gates = topk_probs_flat[sort_idx]
-        sorted_x = x_flat[sorted_token_ids]
 
-        # Per-expert slot index via cummax over (position * is_first); avoids
-        # the dynamic-shape ``nonzero`` that would graph-break under compile.
+        # Per-expert slot index via cummax over (position * is_first);
+        # avoids the dynamic-shape ``nonzero`` that would graph-break
+        # under compile.
         M = sorted_expert_ids.size(0)
         positions = torch.arange(M, device=device)
         diff = sorted_expert_ids[1:] != sorted_expert_ids[:-1]
@@ -211,6 +322,7 @@ class MoELayer(nn.Module):
         group_starts = (positions * is_first.long()).cummax(dim=0).values
         slot_indices = positions - group_starts
 
+        sorted_x = x_flat[sorted_token_ids]
         # Over-capacity tokens are routed to a sentinel slot C and trimmed.
         valid = slot_indices < C
         safe_slot = torch.where(
@@ -234,9 +346,7 @@ class MoELayer(nn.Module):
         expert_tok = expert_tok[:, :C].contiguous()
         expert_mask = expert_mask[:, :C].contiguous()
 
-        expert_out = torch.zeros(E, C, d_model, device=device, dtype=dtype)
-        for e in range(E):
-            expert_out[e] = self.sparse_experts[e](expert_in[e])
+        expert_out = self.sparse_experts.forward_batched(expert_in)
 
         # Static-shape scatter: invalid slots route to sentinel index N and
         # are trimmed off after the index_add_.
@@ -268,10 +378,10 @@ class MoELayer(nn.Module):
         """Per-row balance update for one loop iteration. Call after
         ``optimizer.step()``."""
         with torch.no_grad():
-            expert_mask = F.one_hot(
-                topk_indices, num_classes=self.num_sparse_experts
-            ).sum(dim=2).float()
-            load = expert_mask.sum(dim=[0, 1])
+            load = _expert_load_from_topk(
+                topk_indices, self.num_sparse_experts
+            )
+            load = _maybe_all_reduce_load(load)
             total = load.sum() + 1e-9
             load_fraction = load / total
             target_fraction = 1.0 / self.num_sparse_experts
@@ -297,15 +407,12 @@ class MoELayer(nn.Module):
                 f"entries, got {len(topk_per_loop)}"
             )
         with torch.no_grad():
-            loads = []
-            for topk in topk_per_loop:
-                expert_mask = F.one_hot(
-                    topk, num_classes=self.num_sparse_experts
-                ).sum(dim=2).float()
-                load = expert_mask.sum(dim=[0, 1])
-                total = load.sum() + 1e-9
-                loads.append(load / total)
-            loads = torch.stack(loads, dim=0)
+            loads = torch.stack([
+                _expert_load_from_topk(topk, self.num_sparse_experts)
+                for topk in topk_per_loop
+            ], dim=0)
+            loads = _maybe_all_reduce_load(loads)
+            loads = loads / (loads.sum(dim=1, keepdim=True) + 1e-9)
 
             target = 1.0 / self.num_sparse_experts
 
@@ -499,7 +606,7 @@ class TransformerBlock(nn.Module):
             return x, aux_loss, topk_indices
         else:
             x = x + self.ffn(self.ffn_norm(x))
-            return x, torch.tensor(0.0, device=x.device, dtype=x.dtype), None
+            return x, torch.zeros((), device=x.device, dtype=x.dtype), None
 
 
 class BaselineTransformer(nn.Module):
@@ -539,7 +646,7 @@ class BaselineTransformer(nn.Module):
         x = self.token_emb(input_ids)
         x = self.dropout(x)
 
-        aux_loss = torch.tensor(0.0, device=input_ids.device, dtype=x.dtype)
+        aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []
         for layer in self.layers:
             x, layer_aux, layer_topk = layer(x, attention_mask=attention_mask, is_causal=is_causal)
@@ -551,16 +658,16 @@ class BaselineTransformer(nn.Module):
 
         loss: Optional[torch.Tensor] = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            if (shift_labels != -100).any():
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100,
-                )
-            else:
-                loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+            shift_logits = logits[..., :-1, :]
+            shift_labels = labels[..., 1:]
+            flat_labels = shift_labels.reshape(-1)
+            loss_sum = F.cross_entropy(
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                flat_labels,
+                ignore_index=-100,
+                reduction="sum",
+            )
+            loss = loss_sum / (flat_labels != -100).sum().clamp_min(1)
 
         return {
             "logits": logits,

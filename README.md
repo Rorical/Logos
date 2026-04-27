@@ -75,9 +75,12 @@ logos/
 │   └── logos.py           # LogosTransformer
 ├── scripts/
 │   ├── train.py           # Unified causal LM training, --model {baseline, linear, ...}
+│   ├── train_xla.py       # TPU/XLA training with the same model/dataset/checkpoint flags
 │   └── train_chat.py      # ChatML-formatted fine-tune (assistant-only loss masking)
 ├── notebooks/
-│   └── train_colab.ipynb  # 1 B-MoE bake-off across all seven variants on A100
+│   ├── train_colab.ipynb  # 1 B-MoE bake-off across all seven variants on A100
+│   ├── pretrain_logos_colab.ipynb  # Blackwell GPU pretraining wrapper
+│   └── pretrain_logos_tpu_v6e_colab.ipynb  # TPU v6e/XLA pretraining wrapper
 ├── utils/
 │   └── tokenizer.py       # Tiktoken wrapper with ChatML support
 ├── pyproject.toml         # uv-managed dependencies
@@ -129,6 +132,22 @@ uv run python scripts/train.py \
 
 `scripts/train.py --help` lists every flag (per-variant flags are gated to the relevant `--model`).
 
+TPU training uses the same CLI through `scripts/train_xla.py` and should be run
+on a TPU VM with a PyTorch/XLA build matching the installed PyTorch version:
+
+```bash
+PJRT_DEVICE=TPU uv run python scripts/train_xla.py \
+    --model logos \
+    --dataset tiny_shakespeare \
+    --bf16 \
+    --batch-size 4 --epochs 20 --lr 3e-4
+```
+
+The XLA driver keeps the standard observability and artifact flow: rank-0 W&B
+logging, EMA validation, MoE load histograms, rolling checkpoints,
+`history.json`, and final checkpoints. `--compile` is ignored because XLA
+performs lazy device compilation.
+
 ## Bake-off notebook
 
 `notebooks/train_colab.ipynb` runs all seven variants at ~1 B parameters with matched MoE settings on WikiText-103, then loads each run's `runs/<name>/history.json` and produces a side-by-side loss-curve plot. Each variant uses `--no-save` so only the lightweight `history.json` files are written; drop the flag to keep weights.
@@ -147,7 +166,7 @@ Inference and cached generation (KV cache for SWA, recurrent state for KDA, grow
 ## Requirements
 
 - Python ≥ 3.13
-- PyTorch with CUDA support
+- PyTorch with CUDA support for GPU training, or a matching PyTorch/XLA build for TPU training
 - `uv` for dependency management
 
 ## License
