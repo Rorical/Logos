@@ -252,10 +252,14 @@ class LogosTransformer(nn.Module):
         cfg = self.config
         kinit = default_kernel_init()
 
-        # Token embedding
-        x = nn.Embed(
+        # Token embedding (kept as a reference so we can use embed.attend()
+        # for the tied LM head, which is the canonical Flax pattern; reading
+        # self.variables["params"]["token_emb"]["embedding"] during apply has
+        # been a source of fragile HLO with autograd).
+        embed = nn.Embed(
             cfg.vocab_size, cfg.d_model, embedding_init=kinit, name="token_emb",
-        )(input_ids)
+        )
+        x = embed(input_ids)
         x = nn.Dropout(rate=cfg.dropout)(x, deterministic=deterministic)
 
         aux_loss = jnp.zeros((), dtype=x.dtype)
@@ -327,16 +331,18 @@ class LogosTransformer(nn.Module):
         )(blocks, partial)
         x = RMSNorm(eps=cfg.norm_eps, name="final_norm")(h_main)
 
-        # Tied LM head: reuse token_emb weight
-        emb_weight = self.variables["params"]["token_emb"]["embedding"]
-        logits = x @ emb_weight.T
+        # Tied LM head: use embed.attend (== x @ embedding.T) so Flax routes
+        # the parameter through the registered submodule rather than via
+        # self.variables — yields cleaner HLO under jit + autograd.
+        logits = embed.attend(x)
 
         chunk_sz = int(getattr(cfg, "lm_head_chunk_size", 0) or 0)
         loss = None
         if labels is not None:
             if chunk_sz > 0:
+                emb_weight = embed.embedding  # (vocab, d_model)
                 loss = chunked_linear_cross_entropy(
-                    x, emb_weight,  # emb_weight is (vocab, d_model) — correct
+                    x, emb_weight,
                     labels,
                     chunk_size=chunk_sz,
                     ignore_index=-100,

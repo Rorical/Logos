@@ -154,14 +154,14 @@ def _kda_chunk_scan(
             flat = flat * rrms * compressor_norm_w.astype(jnp.float32)
             latent = (flat @ compressor_down_k.astype(jnp.float32)).astype(orig_dtype)
 
+            # Always write somewhere; mask via jnp.where so non-snap iterations
+            # write back the existing value (effective no-op). Avoids lax.cond
+            # inside fori_loop, which has produced fragile HLO for scatter ops.
             is_snap_step = (n + 1) % chunks_per_snapshot == 0
-            snap_idx = (n + 1) // chunks_per_snapshot - 1
-            snap_latents = jax.lax.cond(
-                is_snap_step,
-                lambda sl: sl.at[:, snap_idx].set(latent),
-                lambda sl: sl,
-                snap_latents,
-            )
+            safe_snap_idx = jnp.maximum((n + 1) // chunks_per_snapshot - 1, 0)
+            current = snap_latents[:, safe_snap_idx]
+            new_val = jnp.where(is_snap_step, latent, current)
+            snap_latents = snap_latents.at[:, safe_snap_idx].set(new_val)
 
         return (S, outputs, snap_latents)
 
