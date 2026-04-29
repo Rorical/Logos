@@ -332,6 +332,93 @@ def log_moe_load(
         wandb.log(metrics, step=step)
 
 
+def _summarize_optimizer_state(optimizer) -> Dict[str, Dict[str, float]]:
+    """Per-(sub-optimizer, param-group) summary of optimizer-state magnitudes.
+
+    For each tensor state key (Muon's ``momentum_buffer``, AdamW's
+    ``exp_avg`` / ``exp_avg_sq``) we compute one ``mean(|state|)`` per
+    parameter and reduce them with a single ``stack().mean()`` per group
+    — so the GPU sync cost is O(opt-groups × state-keys), not per-parameter.
+    Scalar-style keys (``step``) are reported as the max across the
+    group's parameters. Returns a nested ``{label: {field: scalar}}`` dict
+    so the caller can both print a one-line summary and wandb-log under
+    ``opt/<label>/<field>``.
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    sub_opts = getattr(optimizer, "optimizers", [optimizer])
+    for opt in sub_opts:
+        kind = type(opt).__name__.lower()
+        for gi, g in enumerate(opt.param_groups):
+            label = f"{kind}_g{gi}"
+            buffers: Dict[str, list] = {}
+            steps: list = []
+            n_with_state = 0
+            for p in g["params"]:
+                st = opt.state.get(p)
+                if not st:
+                    continue
+                n_with_state += 1
+                for k, v in st.items():
+                    if k == "step":
+                        if torch.is_tensor(v):
+                            steps.append(v.detach().reshape(()).float())
+                        else:
+                            steps.append(torch.tensor(float(v)))
+                    elif torch.is_tensor(v) and v.numel() > 0:
+                        buffers.setdefault(k, []).append(
+                            v.detach().abs().float().mean()
+                        )
+            if n_with_state == 0:
+                continue
+            entry: Dict[str, float] = {
+                "lr": float(g.get("lr", 0.0)),
+                "n_params": float(len(g["params"])),
+                "n_with_state": float(n_with_state),
+            }
+            for k, items in buffers.items():
+                entry[f"mean_abs_{k}"] = torch.stack(items).mean().item()
+            if steps:
+                entry["step"] = float(torch.stack(steps).max().item())
+            out[label] = entry
+    return out
+
+
+def _format_optimizer_state(summary: Dict[str, Dict[str, float]], step: int) -> str:
+    parts: list = []
+    for label, entry in summary.items():
+        chunks: list = [f"step={int(entry.get('step', step))}"]
+        for k, v in entry.items():
+            if not k.startswith("mean_abs_"):
+                continue
+            chunks.append(f"|{k[len('mean_abs_'):]}|={v:.3e}")
+        parts.append(f"{label} " + " ".join(chunks))
+    return "[opt {0}] ".format(step) + " | ".join(parts)
+
+
+def _moe_max_load_local(
+    topk_indices_list, num_experts: int,
+) -> Optional[float]:
+    """Cluster-agnostic local approximation of max-load-fraction across
+    layers, intended for tqdm postfix only. Skips the all-reduce that
+    ``_moe_load_metrics`` performs (1 sync per layer becomes 1 sync per
+    update_every-call total). Stack the per-layer max-fractions and let a
+    single ``.item()`` finalize them.
+    """
+    if topk_indices_list is None or num_experts <= 0:
+        return None
+    fractions: list = []
+    for topk in topk_indices_list:
+        if topk is None:
+            continue
+        counts = torch.bincount(
+            topk.reshape(-1), minlength=num_experts,
+        ).float()
+        fractions.append(counts.max() / counts.sum().clamp_min(1))
+    if not fractions:
+        return None
+    return torch.stack(fractions).max().item()
+
+
 MODEL_REGISTRY: Dict[str, tuple] = {
     "baseline": (BaselineConfig, BaselineTransformer),
     "linear": (LinearConfig, LinearTransformer),
@@ -1400,14 +1487,19 @@ def evaluate(
     model: nn.Module, dataloader: DataLoader, device: torch.device,
     use_amp: bool, mp_dtype: torch.dtype, max_batches: Optional[int] = None,
 ) -> Dict[str, float]:
-    """Single pass over ``dataloader``; returns ``{loss, ppl}``. Under DDP
-    every rank evaluates its shard and we all-reduce a per-batch running
-    sum so ranks agree on the reported metric. Restores train mode on
-    exit so the caller doesn't have to."""
+    """Single pass over ``dataloader``; returns ``{loss, ppl, n_skipped}``.
+    Under DDP every rank evaluates its shard and we all-reduce a per-batch
+    running sum so ranks agree on the reported metric. Batches whose loss
+    is NaN/Inf are skipped (and counted) instead of poisoning the running
+    sum — observed when the val path falls back to eager flex_attention
+    after the compiled-cache busts during sampling, where bf16 score_mod
+    can occasionally underflow into a -inf softmax row.
+    """
     was_training = model.training
     model.train(False)
-    loss_sum = torch.zeros(1, device=device)
-    count = torch.zeros(1, device=device)
+    loss_sum = torch.zeros(1, device=device, dtype=torch.float64)
+    count = torch.zeros(1, device=device, dtype=torch.float64)
+    skipped = torch.zeros(1, device=device, dtype=torch.float64)
     for i, batch in enumerate(dataloader):
         if max_batches is not None and i >= max_batches:
             break
@@ -1415,17 +1507,26 @@ def evaluate(
         lbls = batch["labels"].to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, dtype=mp_dtype, enabled=use_amp):
             out = model(input_ids=ids, attention_mask=None, labels=lbls, is_causal=True)
-        loss_sum += out["loss"].detach()
-        count += 1
+        loss_b = out["loss"].detach().to(torch.float64)
+        finite = torch.isfinite(loss_b)
+        loss_sum += torch.where(finite, loss_b, torch.zeros_like(loss_b))
+        count += finite.to(torch.float64)
+        skipped += (~finite).to(torch.float64)
     model.train(was_training)
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(skipped, op=dist.ReduceOp.SUM)
     n = count.item()
+    n_skipped = int(skipped.item())
     if n == 0:
-        return {"loss": float("inf"), "ppl": float("inf")}
+        return {"loss": float("inf"), "ppl": float("inf"), "n_skipped": n_skipped}
     avg = (loss_sum / count).item()
-    return {"loss": avg, "ppl": math.exp(min(avg, 20))}
+    return {
+        "loss": avg,
+        "ppl": math.exp(min(avg, 20)),
+        "n_skipped": n_skipped,
+    }
 
 
 def run_step_training(
@@ -1595,18 +1696,42 @@ def run_step_training(
             # total throughput.
             steps_this_run = step - start_step
             tps = (steps_this_run * args.batch_size * args.max_length * world_size) / max(elapsed, 1)
-            pbar.set_postfix({
+            postfix = {
                 "loss": f"{avg:.3f}", "ppl": f"{ppl:.1f}",
                 "lr": f"{optimizer.param_groups[0]['lr']:.1e}",
                 "tok/s": f"{tps:.0f}",
-            })
+            }
+            # Approximate per-rank max expert-load fraction across all MoE
+            # layers; cheap enough to update on every tqdm refresh and
+            # gives early warning of router collapse without waiting for
+            # the throttled --moe-log-every wandb dump.
+            moe_max = _moe_max_load_local(
+                topk_indices, args.num_sparse_experts,
+            ) if args.use_moe else None
+            wandb_extra: Dict[str, Any] = {}
+            if moe_max is not None:
+                postfix["moe_max"] = f"{moe_max:.3f}"
+                wandb_extra["train/moe_max_load_local"] = moe_max
+            pbar.set_postfix(postfix)
             wandb_log({
                 "train/avg_loss": avg,
                 "train/avg_ppl": ppl,
                 "train/tok_per_sec": tps,
+                **wandb_extra,
             }, step=step)
             running_loss = 0.0
             running_count = 0
+
+        if (args.opt_state_log_every > 0
+                and step % args.opt_state_log_every == 0):
+            opt_summary = _summarize_optimizer_state(optimizer)
+            if main and opt_summary:
+                print(_format_optimizer_state(opt_summary, step))
+                flat: Dict[str, float] = {}
+                for label, entry in opt_summary.items():
+                    for field, value in entry.items():
+                        flat[f"opt/{label}/{field}"] = value
+                wandb_log(flat, step=step)
 
         eval_due = (
             args.eval_every > 0 and step % args.eval_every == 0
@@ -1631,9 +1756,15 @@ def run_step_training(
             if main:
                 log = (f"\nstep {step:>6} | val_loss {val_metrics['loss']:.4f} "
                        f"(ppl {val_metrics['ppl']:.2f})")
+                n_sk = val_metrics.get("n_skipped", 0)
+                if n_sk:
+                    log += f" | skipped {n_sk} non-finite val batch(es)"
                 if ema_val_metrics is not None and ema_val_metrics["loss"] != float("inf"):
                     log += (f" | ema_val {ema_val_metrics['loss']:.4f} "
                             f"(ppl {ema_val_metrics['ppl']:.2f})")
+                    n_sk_ema = ema_val_metrics.get("n_skipped", 0)
+                    if n_sk_ema:
+                        log += f" | ema skipped {n_sk_ema}"
                 print(log)
                 history.append({
                     "step": step,
@@ -1643,10 +1774,12 @@ def run_step_training(
                 eval_log = {
                     "val/loss": val_metrics["loss"],
                     "val/ppl": val_metrics["ppl"],
+                    "val/n_skipped": val_metrics.get("n_skipped", 0),
                 }
                 if ema_val_metrics is not None:
                     eval_log["ema_val/loss"] = ema_val_metrics["loss"]
                     eval_log["ema_val/ppl"] = ema_val_metrics["ppl"]
+                    eval_log["ema_val/n_skipped"] = ema_val_metrics.get("n_skipped", 0)
                 wandb_log(eval_log, step=step)
             is_best = val_metrics["loss"] < best_val_loss
             if is_best:
@@ -1992,6 +2125,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "(~one bincount + all_reduce per MoE layer) to "
                              "leave on for the full run; useful for catching "
                              "router collapse early.")
+    parser.add_argument("--opt-state-log-every", type=int, default=1000,
+                        help="Log a one-line optimizer-state summary (per "
+                             "sub-optimizer / param-group: step counter and "
+                             "mean(|state|) for each tensor state key — "
+                             "Muon's momentum_buffer, AdamW's exp_avg / "
+                             "exp_avg_sq) every N steps. 0 disables. Useful "
+                             "for verifying that resumed runs reload "
+                             "optimizer moments (state should be non-zero "
+                             "post-warmup) and for spotting collapsing or "
+                             "exploding update magnitudes. Single sync per "
+                             "(group, state-key) — cheap to leave on.")
 
     parser.add_argument("--sample-every", type=int, default=1,
                         help="In epoch mode: sample every N epochs. "
