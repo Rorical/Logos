@@ -1577,6 +1577,8 @@ def run_step_training(
     best_val_loss = float("inf")
     running_loss = 0.0
     running_count = 0
+    nonfinite_skips = 0
+    nonfinite_warned = False
     step = start_step
     t0 = time.time()
     # ``initial`` aligns the bar with the resumed position, while ``total``
@@ -1619,20 +1621,50 @@ def run_step_training(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             if grad_clip > 0 else None
         )
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-        if muon_hp is not None:
-            muon_hp.step()
 
-        # Router-bias and EMA updates always go through the unwrapped raw
-        # model so DDP/compile attribute forwarding can't desync the bias
-        # buffer or break AveragedModel's parameter-id snapshot.
+        # NaN/Inf guard: one bad batch (e.g., a -inf softmax row from
+        # eager flex_attention fallback) would otherwise propagate
+        # NaN gradients into the optimizer and permanently poison the
+        # parameters. We sync once per step (loss + grad_norm) and skip
+        # optimizer.step / scheduler.step / muon_hp.step / router-bias /
+        # EMA when either is non-finite. Set-to-none zero_grad above
+        # already left grads cleared; the explicit zero_grad here is a
+        # belt-and-suspenders that also clears any NaN grads produced
+        # by this step's backward before the next iteration starts.
+        finite_scalars = [loss.detach().reshape(1)]
+        if grad_norm is not None:
+            finite_scalars.append(grad_norm.detach().reshape(1))
+        finite_check = torch.isfinite(
+            torch.cat(finite_scalars)
+        ).all().item()
+
         topk_indices = outputs.get("topk_indices")
-        if topk_indices is not None:
-            raw_model.update_router_biases(topk_indices)
-        if ema_model is not None:
-            ema_model.update_parameters(raw_model)
+        if finite_check:
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            if muon_hp is not None:
+                muon_hp.step()
+
+            # Router-bias and EMA updates always go through the unwrapped
+            # raw model so DDP/compile attribute forwarding can't desync
+            # the bias buffer or break AveragedModel's parameter-id
+            # snapshot.
+            if topk_indices is not None:
+                raw_model.update_router_biases(topk_indices)
+            if ema_model is not None:
+                ema_model.update_parameters(raw_model)
+        else:
+            optimizer.zero_grad(set_to_none=True)
+            nonfinite_skips += 1
+            if main and not nonfinite_warned:
+                print(
+                    f"\n[train] non-finite loss/grad at step {step + 1} — "
+                    f"skipping optim step. Subsequent skips will be "
+                    f"counted silently and surfaced via the tqdm "
+                    f"`skips=` postfix and wandb `train/nonfinite_skips`."
+                )
+                nonfinite_warned = True
 
         # Periodic MoE expert-load instrumentation. Aligned to step+1 so
         # the very first step never logs (avoids capturing untrained
@@ -1658,8 +1690,12 @@ def run_step_training(
         else:
             loss_val = loss_d.cpu().item()
             grad_norm_val = None
-        running_loss += loss_val
-        running_count += 1
+        # Exclude non-finite losses from the running average so a single
+        # bad batch doesn't poison the displayed loss; running_count
+        # tracks finite contributions only.
+        if math.isfinite(loss_val):
+            running_loss += loss_val
+            running_count += 1
         pbar.update(1)
 
         # Per-step W&B log (rank-0 only via wandb_log). Includes the raw
@@ -1686,8 +1722,14 @@ def run_step_training(
             wandb_log(metrics, step=step)
 
         if step % log_every == 0 and main:
-            avg = running_loss / running_count
-            ppl = math.exp(min(avg, 20))
+            if running_count > 0:
+                avg = running_loss / running_count
+                ppl = math.exp(min(avg, 20))
+            else:
+                # Entire window was non-finite; surface that explicitly
+                # rather than dividing by zero.
+                avg = float("nan")
+                ppl = float("nan")
             elapsed = time.time() - t0
             # Cluster-wide tokens/sec for the *current* run — counts only
             # post-resume steps so an old checkpoint doesn't inflate the
@@ -1712,6 +1754,9 @@ def run_step_training(
             if moe_max is not None:
                 postfix["moe_max"] = f"{moe_max:.3f}"
                 wandb_extra["train/moe_max_load_local"] = moe_max
+            if nonfinite_skips:
+                postfix["skips"] = str(nonfinite_skips)
+                wandb_extra["train/nonfinite_skips"] = nonfinite_skips
             pbar.set_postfix(postfix)
             wandb_log({
                 "train/avg_loss": avg,
