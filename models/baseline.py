@@ -284,7 +284,16 @@ class MoELayer(nn.Module):
         E = self.num_sparse_experts
         K = self.top_k
 
-        router_logits = self.router(x) + self.bias[loop_idx]
+        # Canonical DeepSeek-V3 routing: bias steers selection only; gate
+        # values come from the unbiased logits so the bias-balancing loop
+        # can rebalance load without simultaneously suppressing the
+        # gradient signal flowing back to the over-used expert. Pre-fix
+        # behaviour added bias to logits, softmaxed, and used those probs
+        # both for top-K and for gates — which meant lowering bias[e]
+        # also lowered e's gate, starving e of training signal and
+        # locking in the load asymmetry.
+        raw_logits = self.router(x)
+        biased_logits = raw_logits + self.bias[loop_idx]
 
         shared_out = sum(expert(x) for expert in self.shared_experts) / self.num_shared_experts
 
@@ -293,12 +302,11 @@ class MoELayer(nn.Module):
 
         x_flat = x.view(-1, d_model)
 
-        router_probs = F.softmax(router_logits, dim=-1)
-
-        topk_probs, topk_indices = torch.topk(router_probs, K, dim=-1)
-        topk_probs = topk_probs / (
-            topk_probs.sum(dim=-1, keepdim=True) + 1e-9
-        )
+        # Top-K selection from biased logits.
+        _, topk_indices = torch.topk(biased_logits, K, dim=-1)
+        # Gates from raw (unbiased) logits at the selected experts.
+        selected_raw = raw_logits.gather(-1, topk_indices)
+        topk_probs = F.softmax(selected_raw, dim=-1)
 
         topk_indices_flat = topk_indices.view(-1)
         topk_probs_flat = topk_probs.view(-1)
