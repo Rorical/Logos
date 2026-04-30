@@ -14,7 +14,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -397,12 +397,13 @@ def _format_optimizer_state(summary: Dict[str, Dict[str, float]], step: int) -> 
 
 def _moe_max_load_local(
     topk_indices_list, num_experts: int,
-) -> Optional[float]:
+) -> Optional[Tuple[float, List[float]]]:
     """Cluster-agnostic local approximation of max-load-fraction across
-    layers, intended for tqdm postfix only. Skips the all-reduce that
-    ``_moe_load_metrics`` performs (1 sync per layer becomes 1 sync per
-    update_every-call total). Stack the per-layer max-fractions and let a
-    single ``.item()`` finalize them.
+    layers, intended for tqdm postfix and per-layer wandb keys. Skips
+    the all-reduce that ``_moe_load_metrics`` performs (1 sync per layer
+    becomes 1 sync per update_every-call total). Returns ``(global_max,
+    per_layer_list)`` so callers can log each layer separately and spot
+    a single layer collapsing while the global max still looks healthy.
     """
     if topk_indices_list is None or num_experts <= 0:
         return None
@@ -416,7 +417,10 @@ def _moe_max_load_local(
         fractions.append(counts.max() / counts.sum().clamp_min(1))
     if not fractions:
         return None
-    return torch.stack(fractions).max().item()
+    # Single device->host sync: stack once, transfer the whole vector,
+    # then reduce on the CPU side.
+    per_layer = torch.stack(fractions).cpu().tolist()
+    return max(per_layer), per_layer
 
 
 MODEL_REGISTRY: Dict[str, tuple] = {
@@ -486,7 +490,7 @@ class MultiScheduler:
 
 
 def split_param_groups(model):
-    """Three-way split for the Muon/AdamW recipe.
+    """Four-way split for the Muon/AdamW recipe.
 
     * ``muon``    — exactly-2D weights inside transformer blocks
                     (``nn.Linear.weight``). PyTorch's Muon hard-rejects
@@ -495,10 +499,15 @@ def split_param_groups(model):
                     model untied them). Routed to AdamW with a higher
                     base lr because input embeddings receive sparse
                     per-token gradients and benefit from larger steps.
-    * ``default`` — everything else: RMSNorm scales, attention sink
-                    logits, biases (1D), plus 3D ``Conv1d`` kernels in
-                    the SuperLinear path. Handled by AdamW at the
-                    standard base lr.
+    * ``default`` — RMSNorm scales, attention sink logits, biases (1D),
+                    plus 3D ``Conv1d`` kernels in the SuperLinear path.
+                    Handled by AdamW at the standard base lr.
+    * ``router``  — MoE ``Router.linear.weight`` matrices. Pulled out
+                    of ``muon`` so they can run on AdamW with a smaller
+                    LR and a longer warmup; the bias-balance mechanism
+                    needs time to find a balanced equilibrium before
+                    router weights start moving aggressively, otherwise
+                    early imbalances lock in a fixed top-K subset.
 
     Tied tensors are deduped by ``id()`` — when ``lm_head.weight is
     token_emb.weight`` (current default in every model here), the
@@ -510,21 +519,31 @@ def split_param_groups(model):
         if mod is not None and hasattr(mod, "weight"):
             embed_ids.add(id(mod.weight))
 
+    router_ids: set[int] = set()
+    for name, param in model.named_parameters():
+        # Match e.g. ``...ffn.router.linear.weight`` across all model
+        # variants that use the shared ``MoELayer`` from baseline.py.
+        if name.endswith("router.linear.weight"):
+            router_ids.add(id(param))
+
     seen: set[int] = set()
     muon: list = []
     embed: list = []
     default: list = []
+    router: list = []
     for _, param in model.named_parameters():
         if not param.requires_grad or id(param) in seen:
             continue
         seen.add(id(param))
         if id(param) in embed_ids:
             embed.append(param)
+        elif id(param) in router_ids:
+            router.append(param)
         elif param.ndim == 2:
             muon.append(param)
         else:
             default.append(param)
-    return muon, embed, default
+    return muon, embed, default, router
 
 
 def wsd_lr_lambda(warmup_steps: int, decay_steps: int, total_steps: int):
@@ -639,15 +658,19 @@ def build_optimizer_and_scheduler(
     muon_params: list,
     embed_params: list,
     default_params: list,
+    router_params: Optional[list] = None,
 ):
     """Build the Muon + AdamW pair and their schedulers.
 
-    AdamW carries two param groups (embed, default) with different base
-    lrs but a single shared scheduler — the WSD/cosine multiplier
-    scales each group's ``lr`` by the same factor so the relative ratio
-    stays fixed throughout training. ``--no-muon`` collapses the
-    matrix bucket into AdamW's default group at the AdamW lr.
+    AdamW carries up to three param groups (embed, default, router)
+    with different base lrs. The WSD/cosine multiplier scales each
+    group's ``lr`` by its own lambda — embed/default share the global
+    warmup, while router uses a longer warmup (``--router-warmup-steps``
+    or ``3 * --warmup-steps`` by default). ``--no-muon`` collapses the
+    matrix bucket into AdamW's default group at the AdamW lr; routers
+    keep their dedicated group regardless.
     """
+    router_params = list(router_params or [])
     use_muon = args.muon and len(muon_params) > 0
     if not use_muon:
         default_params = list(default_params) + list(muon_params)
@@ -667,41 +690,64 @@ def build_optimizer_and_scheduler(
         optimizers.append(muon_opt)
         muon_optimizers.append(muon_opt)
     adamw_groups: list = []
+    # Track per-group "kind" so the scheduler can pick the right lambda
+    # (router groups get a longer warmup than embed/default).
+    adamw_group_kinds: list = []
     if embed_params:
         adamw_groups.append({"params": embed_params, "lr": args.embed_lr})
+        adamw_group_kinds.append("base")
     if default_params:
         adamw_groups.append({"params": default_params, "lr": args.lr})
+        adamw_group_kinds.append("base")
+    if router_params:
+        adamw_groups.append({"params": router_params, "lr": args.router_lr})
+        adamw_group_kinds.append("router")
+    adamw_opt = None
     if adamw_groups:
-        optimizers.append(torch.optim.AdamW(
+        adamw_opt = torch.optim.AdamW(
             adamw_groups,
             lr=args.lr,
             weight_decay=args.weight_decay,
             betas=(0.9, 0.95),
             fused=fused_adamw,
-        ))
+        )
+        optimizers.append(adamw_opt)
     optimizer = MultiOptimizer(optimizers)
 
+    router_warmup = (
+        args.router_warmup_steps
+        if args.router_warmup_steps is not None
+        else max(args.warmup_steps, 3 * args.warmup_steps)
+    )
     if args.scheduler == "wsd":
         decay_steps = (
             args.decay_steps
             if args.decay_steps is not None
             else max(1, int(args.decay_frac * total_steps))
         )
-        lr_fn = wsd_lr_lambda(args.warmup_steps, decay_steps, total_steps)
+        base_lr_fn = wsd_lr_lambda(args.warmup_steps, decay_steps, total_steps)
+        router_lr_fn = wsd_lr_lambda(router_warmup, decay_steps, total_steps)
     elif args.scheduler == "cosine":
-        lr_fn = cosine_lr_lambda(args.warmup_steps, total_steps, min_ratio=0.1)
+        base_lr_fn = cosine_lr_lambda(args.warmup_steps, total_steps, min_ratio=0.1)
+        router_lr_fn = cosine_lr_lambda(router_warmup, total_steps, min_ratio=0.1)
     else:
         raise ValueError(f"Unknown --scheduler '{args.scheduler}'")
 
     schedulers: list = []
     for o in optimizers:
         # LambdaLR multiplies each param-group's base lr (its initial
-        # lr at construction) by the lambda's return value, so AdamW's
-        # embed/default groups stay correctly differentiated.
+        # lr at construction) by the lambda's return value. AdamW gets
+        # a per-group lambda list so router uses the longer warmup;
+        # Muon's sole group uses the base lambda.
+        if o is adamw_opt:
+            lambdas = [
+                router_lr_fn if k == "router" else base_lr_fn
+                for k in adamw_group_kinds
+            ]
+        else:
+            lambdas = [base_lr_fn] * len(o.param_groups)
         schedulers.append(
-            torch.optim.lr_scheduler.LambdaLR(
-                o, lr_lambda=[lr_fn] * len(o.param_groups),
-            )
+            torch.optim.lr_scheduler.LambdaLR(o, lr_lambda=lambdas)
         )
     scheduler = MultiScheduler(schedulers)
 
@@ -1759,14 +1805,19 @@ def run_step_training(
             # Approximate per-rank max expert-load fraction across all MoE
             # layers; cheap enough to update on every tqdm refresh and
             # gives early warning of router collapse without waiting for
-            # the throttled --moe-log-every wandb dump.
-            moe_max = _moe_max_load_local(
+            # the throttled --moe-log-every wandb dump. Also emits
+            # per-layer keys so a single layer collapsing while the
+            # global max stays healthy is still visible in wandb.
+            moe_metrics = _moe_max_load_local(
                 topk_indices, args.num_sparse_experts,
             ) if args.use_moe else None
             wandb_extra: Dict[str, Any] = {}
-            if moe_max is not None:
+            if moe_metrics is not None:
+                moe_max, moe_per_layer = moe_metrics
                 postfix["moe_max"] = f"{moe_max:.3f}"
                 wandb_extra["train/moe_max_load_local"] = moe_max
+                for i, val in enumerate(moe_per_layer):
+                    wandb_extra[f"train/moe_max_load_layer_{i:02d}"] = val
             if nonfinite_skips:
                 postfix["skips"] = str(nonfinite_skips)
                 wandb_extra["train/nonfinite_skips"] = nonfinite_skips
@@ -1948,8 +1999,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "iterations). 0 = standard balance only. Try "
                              "0.5–1.0 to encourage different expert "
                              "selections per loop step.")
-    parser.add_argument("--bias-update-rate", type=float, default=0.01,
-                        help="DeepSeek-style router bias update rate")
+    parser.add_argument("--bias-update-rate", type=float, default=0.02,
+                        help="DeepSeek-style router bias update rate. "
+                             "0.02 (default) gives the bias-balance loop "
+                             "enough authority to outpace router-weight "
+                             "drift under the body-loop sharing in "
+                             "``logos`` / ``recursive`` (each forward "
+                             "applies the same router num_loops times). "
+                             "Drop to 0.01 for non-looped baselines or "
+                             "for tighter convergence late in training.")
     parser.add_argument("--block-residual-isolate-softmax", action="store_true",
                         help="Route the BlockAttentionResidual depth-softmax "
                              "+ weighted-sum through an opaque "
@@ -2063,6 +2121,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Muon base lr for transformer-internal 2D "
                              "Linear weights. Raw Muon scaling — not "
                              "AdamW-equivalent rescaling.")
+    parser.add_argument("--router-lr", type=float, default=4e-4,
+                        help="AdamW base lr for MoE Router.linear.weight "
+                             "matrices. Smaller than --lr to give the "
+                             "DeepSeek-style bias-balance loop time to "
+                             "stabilize load before router weights start "
+                             "moving aggressively. Set explicitly when "
+                             "tuning; the 10x-smaller-than-lr default is "
+                             "a safe starting point, not optimal.")
+    parser.add_argument("--router-warmup-steps", type=int, default=None,
+                        help="Linear warmup steps for the router param "
+                             "group. Defaults to 3 * --warmup-steps when "
+                             "unset. Longer warmup gives the bias-balance "
+                             "mechanism a head start so initial routing "
+                             "imbalances don't lock in via fast router-"
+                             "weight gradient updates.")
     parser.add_argument("--weight-decay", type=float, default=0.1,
                         help="AdamW weight decay (constant across training).")
     parser.add_argument("--warmup-steps", type=int, default=500,
@@ -2413,14 +2486,20 @@ def main(args: Optional[argparse.Namespace] = None):
         else len(train_loader) * args.epochs
     )
 
-    muon_params, embed_params, default_params = split_param_groups(model)
+    muon_params, embed_params, default_params, router_params = split_param_groups(model)
     optimizer, scheduler, muon_hp = build_optimizer_and_scheduler(
         args, total_steps, fused_adamw,
-        muon_params, embed_params, default_params,
+        muon_params, embed_params, default_params, router_params,
     )
     n_muon = sum(p.numel() for p in muon_params)
     n_embed = sum(p.numel() for p in embed_params)
     n_default = sum(p.numel() for p in default_params)
+    n_router = sum(p.numel() for p in router_params)
+    router_warmup = (
+        args.router_warmup_steps
+        if args.router_warmup_steps is not None
+        else 3 * args.warmup_steps
+    )
     if main_proc:
         if args.muon and n_muon > 0:
             print(f"  Optimizer: Muon + AdamW")
@@ -2431,6 +2510,10 @@ def main(args: Optional[argparse.Namespace] = None):
             print(f"    AdamW default (lr={args.lr}): "
                   f"{len(default_params)} tensors, {n_default:,} params"
                   + (" (fused)" if fused_adamw else ""))
+            if router_params:
+                print(f"    AdamW router (lr={args.router_lr}, "
+                      f"warmup {router_warmup}): "
+                      f"{len(router_params)} tensors, {n_router:,} params")
             if muon_hp is not None:
                 print(f"    Muon momentum: {args.muon_momentum_start} -> "
                       f"{args.muon_momentum_mid} (step {args.muon_momentum_warmup_1}) -> "
@@ -2439,7 +2522,7 @@ def main(args: Optional[argparse.Namespace] = None):
                       f"{args.muon_wd_end} linearly over {total_steps} steps")
         else:
             print(f"  Optimizer: AdamW only "
-                  f"({n_muon + n_embed + n_default:,} params)"
+                  f"({n_muon + n_embed + n_default + n_router:,} params)"
                   + (" (fused)" if fused_adamw else ""))
         print(f"  LR schedule: {args.scheduler} "
               f"(warmup {args.warmup_steps}"
