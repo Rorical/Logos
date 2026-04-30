@@ -1474,7 +1474,11 @@ def build_streaming_loaders(
         common_kw["persistent_workers"] = True
         common_kw["prefetch_factor"] = max(1, int(args.prefetch_factor))
     train_loader = DataLoader(train_ds, **common_kw)
-    val_loader = DataLoader(val_ds, drop_last=True, **common_kw)
+    # ``drop_last=False`` for val: PackedStream + per-worker sharding can
+    # leave each worker with fewer packed sequences than ``batch_size``
+    # (especially at large ``max_length``), and ``drop_last=True`` would
+    # then yield zero batches and make ``evaluate()`` return inf.
+    val_loader = DataLoader(val_ds, drop_last=False, **common_kw)
     return train_loader, val_loader
 
 
@@ -1520,12 +1524,21 @@ def evaluate(
     n = count.item()
     n_skipped = int(skipped.item())
     if n == 0:
-        return {"loss": float("inf"), "ppl": float("inf"), "n_skipped": n_skipped}
+        # n_seen lets the caller distinguish "empty loader" (n_skipped==0)
+        # from "every batch was non-finite" (n_skipped==N>0); both result
+        # in inf but have very different root causes.
+        return {
+            "loss": float("inf"),
+            "ppl": float("inf"),
+            "n_skipped": n_skipped,
+            "n_seen": int(n_skipped),
+        }
     avg = (loss_sum / count).item()
     return {
         "loss": avg,
         "ppl": math.exp(min(avg, 20)),
         "n_skipped": n_skipped,
+        "n_seen": int(n + n_skipped),
     }
 
 
@@ -1802,14 +1815,20 @@ def run_step_training(
                 log = (f"\nstep {step:>6} | val_loss {val_metrics['loss']:.4f} "
                        f"(ppl {val_metrics['ppl']:.2f})")
                 n_sk = val_metrics.get("n_skipped", 0)
-                if n_sk:
-                    log += f" | skipped {n_sk} non-finite val batch(es)"
+                n_seen = val_metrics.get("n_seen", 0)
+                if n_seen == 0:
+                    # Distinguish 0-batch loader from all-non-finite —
+                    # both render as inf but have different fixes.
+                    log += " | EMPTY val_loader (0 batches)"
+                elif n_sk:
+                    log += f" | skipped {n_sk}/{n_seen} non-finite val batch(es)"
                 if ema_val_metrics is not None and ema_val_metrics["loss"] != float("inf"):
                     log += (f" | ema_val {ema_val_metrics['loss']:.4f} "
                             f"(ppl {ema_val_metrics['ppl']:.2f})")
                     n_sk_ema = ema_val_metrics.get("n_skipped", 0)
-                    if n_sk_ema:
-                        log += f" | ema skipped {n_sk_ema}"
+                    n_seen_ema = ema_val_metrics.get("n_seen", 0)
+                    if n_seen_ema and n_sk_ema:
+                        log += f" | ema skipped {n_sk_ema}/{n_seen_ema}"
                 print(log)
                 history.append({
                     "step": step,
