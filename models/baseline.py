@@ -242,12 +242,27 @@ class MoELayer(nn.Module):
     same weights can specialise differently when reused across loops.
     """
 
-    def __init__(self, config: BaselineConfig, num_loops: int = 1):
+    def __init__(
+        self,
+        config: BaselineConfig,
+        num_loops: int = 1,
+        top_k: Optional[int] = None,
+    ):
         super().__init__()
         self.d_model = config.d_model
         self.num_shared_experts = config.num_shared_experts
         self.num_sparse_experts = config.num_sparse_experts
-        self.top_k = config.top_k
+        # Per-instance ``top_k`` override lets boundary stacks (entry/exit)
+        # request more experts per token without touching the body's value.
+        # Validation mirrors ``_validate_moe_config``.
+        if top_k is None:
+            top_k = config.top_k
+        if not (1 <= top_k <= config.num_sparse_experts):
+            raise ValueError(
+                f"MoELayer top_k ({top_k}) must be in "
+                f"[1, num_sparse_experts={config.num_sparse_experts}]"
+            )
+        self.top_k = top_k
         self.bias_update_rate = config.bias_update_rate
         self.capacity_factor = config.capacity_factor
         self.num_loops = num_loops

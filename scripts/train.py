@@ -197,7 +197,20 @@ def init_wandb(args: argparse.Namespace, world_size: int):
             "Install with `pip install wandb` (or "
             "`pip install -e .[wandb]` from the project root)."
         ) from exc
+    # Strip args that belong to other model variants so the run config
+    # doesn't suggest knobs that have no effect on this model. ``vars(args)``
+    # carries every CLI flag regardless of which model consumes it; left
+    # in place those values mislead any later "what was this run
+    # configured with?" lookup.
+    _MODEL_ONLY_ARGS = {
+        "recursive": {"body_gate_init_std"},
+        "residual":  {"num_blocks"},
+    }
     config = {**vars(args), "world_size": world_size}
+    for model_name, only_args in _MODEL_ONLY_ARGS.items():
+        if args.model != model_name:
+            for k in only_args:
+                config.pop(k, None)
     run = wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
@@ -393,6 +406,46 @@ def _format_optimizer_state(summary: Dict[str, Dict[str, float]], step: int) -> 
             chunks.append(f"|{k[len('mean_abs_'):]}|={v:.3e}")
         parts.append(f"{label} " + " ".join(chunks))
     return "[opt {0}] ".format(step) + " | ".join(parts)
+
+
+def clip_grads_per_group(
+    optimizer, max_norm: float,
+) -> Tuple[Optional[torch.Tensor], List[Optional[torch.Tensor]]]:
+    """Per-param-group ``clip_grad_norm_``.
+
+    A single global clip over all parameters lets the highest-LR group's
+    gradients dominate the global L2 norm and silently scale every other
+    group's gradients down. The Muon/AdamW recipe used here puts the
+    embed group at lr=0.1, ``default`` at ~4e-3, router at ~1e-3 — an
+    order-of-magnitude spread where a global clip is dominated by embed
+    for most of training and the matrix groups never actually hit their
+    individual budget.
+
+    Returns ``(global_norm, per_group_norms)`` where ``global_norm`` is
+    ``sqrt(sum(per_group_norm**2))`` (matches what a single global
+    ``clip_grad_norm_`` would have reported pre-clip, so wandb plots and
+    NaN-checks remain comparable to the old metric) and
+    ``per_group_norms`` is in ``optimizer.param_groups`` order. Empty
+    groups (no grads this step) are reported as zero.
+    """
+    norms: List[Optional[torch.Tensor]] = []
+    device: Optional[torch.device] = None
+    for g in optimizer.param_groups:
+        ps = [p for p in g["params"] if p.grad is not None]
+        if not ps:
+            norms.append(None)
+            continue
+        if device is None:
+            device = ps[0].grad.device
+        norms.append(torch.nn.utils.clip_grad_norm_(ps, max_norm))
+    if device is None:
+        return None, norms
+    filled = [
+        n if n is not None else torch.zeros((), device=device)
+        for n in norms
+    ]
+    global_norm = torch.linalg.vector_norm(torch.stack(filled))
+    return global_norm, filled
 
 
 def _moe_max_load_local(
@@ -717,7 +770,7 @@ def build_optimizer_and_scheduler(
     router_warmup = (
         args.router_warmup_steps
         if args.router_warmup_steps is not None
-        else max(args.warmup_steps, 3 * args.warmup_steps)
+        else max(1, args.warmup_steps)
     )
     if args.scheduler == "wsd":
         decay_steps = (
@@ -876,6 +929,8 @@ def build_model(args: argparse.Namespace, vocab_size: int):
             num_body_layers=args.num_body_layers,
             num_exit_layers=args.num_exit_layers,
             num_loops=args.num_loops,
+            entry_top_k=args.entry_top_k,
+            exit_top_k=args.exit_top_k,
             gradient_checkpointing=args.gradient_checkpointing,
             ckpt_granularity=args.ckpt_granularity,
         )
@@ -1085,7 +1140,7 @@ def run_epoch(
         if is_train:
             loss.backward()
             if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                clip_grads_per_group(optimizer, grad_clip)
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
@@ -1674,12 +1729,17 @@ def run_step_training(
             outputs = model(input_ids=ids, attention_mask=None, labels=lbls, is_causal=True)
         loss = outputs["loss"]
         loss.backward()
-        # Capture pre-clip grad norm so wandb can plot it; clip_grad_norm_
-        # returns the total norm regardless of whether clipping kicked in.
-        grad_norm = (
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            if grad_clip > 0 else None
-        )
+        # Per-group pre-clip norms so wandb can plot them and a single
+        # high-LR group (embed) doesn't dominate a global clip and
+        # suppress every other group's gradients. ``grad_norm`` is the
+        # combined L2 of the per-group norms — same scale as the legacy
+        # global clip metric for backward-compatible NaN checks.
+        if grad_clip > 0:
+            grad_norm, per_group_grad_norms = clip_grads_per_group(
+                optimizer, grad_clip,
+            )
+        else:
+            grad_norm, per_group_grad_norms = None, []
 
         # NaN/Inf guard: one bad batch (e.g., a -inf softmax row from
         # eager flex_attention fallback) would otherwise propagate
@@ -1744,11 +1804,21 @@ def run_step_training(
             loss_d = loss_d.clone()
             all_reduce_mean(loss_d)
         if grad_norm is not None:
-            scalars = torch.cat([loss_d, grad_norm.detach().reshape(1)]).cpu().tolist()
-            loss_val, grad_norm_val = scalars[0], scalars[1]
+            # Single device->host sync for loss + global grad norm + per-
+            # group grad norms. Keeps rank-0 wandb logging cheap even
+            # though we now expose one metric per param group.
+            stack_parts = [loss_d, grad_norm.detach().reshape(1)]
+            stack_parts.extend(
+                n.detach().reshape(1) for n in per_group_grad_norms
+            )
+            scalars = torch.cat(stack_parts).cpu().tolist()
+            loss_val = scalars[0]
+            grad_norm_val = scalars[1]
+            per_group_grad_norm_vals = scalars[2:]
         else:
             loss_val = loss_d.cpu().item()
             grad_norm_val = None
+            per_group_grad_norm_vals = []
         # Exclude non-finite losses from the running average so a single
         # bad batch doesn't poison the displayed loss; running_count
         # tracks finite contributions only.
@@ -1776,6 +1846,8 @@ def run_step_training(
                     metrics[f"train/momentum/{tag}"] = pg["momentum"]
                 if "weight_decay" in pg:
                     metrics[f"train/weight_decay/{tag}"] = pg["weight_decay"]
+                if i < len(per_group_grad_norm_vals):
+                    metrics[f"train/grad_norm/{tag}"] = per_group_grad_norm_vals[i]
             if grad_norm_val is not None:
                 metrics["train/grad_norm"] = grad_norm_val
             wandb_log(metrics, step=step)
@@ -2045,6 +2117,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="[recursive,logos] Standard blocks run once after the body loop")
     parser.add_argument("--num-loops", type=int, default=4,
                         help="[recursive,logos] Number of times the body is applied")
+    parser.add_argument("--entry-top-k", type=int, default=None,
+                        help="[logos] Per-stack top_k override for the entry "
+                             "MoEs. Defaults to --top-k. Boundary stacks see "
+                             "less effective routing data than the loop-shared "
+                             "body so a higher top_k (e.g. 2x --top-k) buys "
+                             "headroom against the per-expert capacity = N * "
+                             "top_k * capacity_factor / num_sparse_experts.")
+    parser.add_argument("--exit-top-k", type=int, default=None,
+                        help="[logos] Per-stack top_k override for the exit "
+                             "MoEs. Same rationale as --entry-top-k.")
     parser.add_argument("--gradient-checkpointing", action="store_true",
                         help="[logos] Recompute body activations during "
                              "backward (torch.utils.checkpoint, "
@@ -2121,21 +2203,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Muon base lr for transformer-internal 2D "
                              "Linear weights. Raw Muon scaling — not "
                              "AdamW-equivalent rescaling.")
-    parser.add_argument("--router-lr", type=float, default=4e-4,
+    parser.add_argument("--router-lr", type=float, default=1e-3,
                         help="AdamW base lr for MoE Router.linear.weight "
-                             "matrices. Smaller than --lr to give the "
-                             "DeepSeek-style bias-balance loop time to "
-                             "stabilize load before router weights start "
-                             "moving aggressively. Set explicitly when "
-                             "tuning; the 10x-smaller-than-lr default is "
-                             "a safe starting point, not optimal.")
+                             "matrices. Smaller than --lr so router weights "
+                             "lag the bias-balance loop, but large enough "
+                             "to actually co-adapt with it on boundary "
+                             "stacks (entry/exit) that don't get the "
+                             "body-loop's effective ``num_loops``x update "
+                             "boost. The previous 1e-4-ish default left the "
+                             "router essentially frozen during warmup and "
+                             "the bias balancer oscillated load between "
+                             "experts.")
     parser.add_argument("--router-warmup-steps", type=int, default=None,
                         help="Linear warmup steps for the router param "
-                             "group. Defaults to 3 * --warmup-steps when "
-                             "unset. Longer warmup gives the bias-balance "
-                             "mechanism a head start so initial routing "
-                             "imbalances don't lock in via fast router-"
-                             "weight gradient updates.")
+                             "group. Defaults to --warmup-steps when unset. "
+                             "Earlier defaults stretched this to 3x base "
+                             "warmup, which froze the router so long that "
+                             "the bias balancer was the only force shaping "
+                             "load — and on boundary stacks it oscillated "
+                             "instead of converging.")
     parser.add_argument("--weight-decay", type=float, default=0.1,
                         help="AdamW weight decay (constant across training).")
     parser.add_argument("--warmup-steps", type=int, default=500,

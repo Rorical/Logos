@@ -84,6 +84,14 @@ class LogosConfig(HybridConfig):
     num_exit_layers: int = 2
     num_loops: int = 4
 
+    # Per-stack ``top_k`` override. ``None`` falls back to ``config.top_k``.
+    # Boundary stacks (entry/exit) see less effective routing data per step
+    # than the loop-shared body, so their bias-balancer can take much
+    # longer to spread load. Raising their top_k buys headroom against
+    # the per-expert capacity = N * top_k * capacity_factor / num_experts.
+    entry_top_k: Optional[int] = None
+    exit_top_k: Optional[int] = None
+
     # Re-compute body activations during backward instead of storing them.
     # Trades wall time for lower activation memory on the body — usually
     # the difference between OOM and fitting at 4K+ context. Entry and
@@ -136,7 +144,13 @@ class LogosTransformerBlock(nn.Module):
     The MoE FFN exposes per-loop router-bias rows when ``num_loops > 1``.
     """
 
-    def __init__(self, config: LogosConfig, layer_idx: int, num_loops: int = 1):
+    def __init__(
+        self,
+        config: LogosConfig,
+        layer_idx: int,
+        num_loops: int = 1,
+        top_k: Optional[int] = None,
+    ):
         super().__init__()
         self.use_moe = config.use_moe
         self.is_swa = (layer_idx % config.swa_every) == config.swa_offset
@@ -184,7 +198,7 @@ class LogosTransformerBlock(nn.Module):
 
         self.ffn_norm = RMSNorm(config.d_model, eps=config.norm_eps)
         if config.use_moe:
-            self.ffn = MoELayer(config, num_loops=num_loops)
+            self.ffn = MoELayer(config, num_loops=num_loops, top_k=top_k)
         else:
             self.ffn = SwiGLU(config.d_model, config.d_ff, config.dropout)
         self.ffn_res = BlockAttentionResidual(
@@ -250,7 +264,10 @@ class LogosTransformer(nn.Module):
         # Layer indices flow contiguously through entry, body, and exit, so
         # SWA placement is determined by a single global index space.
         self.entry = nn.ModuleList([
-            LogosTransformerBlock(config, layer_idx=i, num_loops=1)
+            LogosTransformerBlock(
+                config, layer_idx=i, num_loops=1,
+                top_k=config.entry_top_k,
+            )
             for i in range(config.num_entry_layers)
         ])
 
@@ -266,7 +283,10 @@ class LogosTransformer(nn.Module):
 
         exit_offset = config.num_entry_layers + config.num_body_layers
         self.exit = nn.ModuleList([
-            LogosTransformerBlock(config, layer_idx=exit_offset + i, num_loops=1)
+            LogosTransformerBlock(
+                config, layer_idx=exit_offset + i, num_loops=1,
+                top_k=config.exit_top_k,
+            )
             for i in range(config.num_exit_layers)
         ])
 
