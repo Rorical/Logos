@@ -298,14 +298,16 @@ class LogosTransformer(nn.Module):
         )
         self.final_norm = RMSNorm(config.d_model, eps=config.norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.lm_head.weight = self.token_emb.weight
 
         self._init_weights()
 
     def _init_weights(self):
         # Block Attention Residual proj weights are zero-initialised so each
-        # depth-wise softmax starts uniform. SnapshotRetrieval.out_up is
-        # zero-initialised so the memory branch is an exact no-op at step 0.
+        # depth-wise softmax starts uniform. SnapshotRetrieval.out_up gets a
+        # small nonzero init (std=1e-3) so the memory branch starts as a
+        # near-no-op while still propagating gradient to its upstream
+        # projections (q_down, k_up, v_up, gate_*) — pure zero-init left
+        # those modules in slow LoRA-warmup for >15K steps.
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -320,7 +322,7 @@ class LogosTransformer(nn.Module):
 
         for module in self.modules():
             if isinstance(module, SnapshotRetrieval):
-                nn.init.zeros_(module.out_up.weight)
+                nn.init.normal_(module.out_up.weight, mean=0.0, std=1e-3)
 
     def _lm_loss(
         self,
