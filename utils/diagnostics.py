@@ -510,26 +510,32 @@ class DiagnosticsMonitor:
 
         key = "grad_ratio_body_entry"
         if ratio_be > GRAD_RATIO_ALERT:
-            issues.append(_Issue(
-                key=key, severe=True,
-                message=(
-                    f"Body grad norm ({avg_body:.3f}) is "
-                    f"{ratio_be:.1f}× entry ({avg_entry:.3f}). "
-                    f"Shared body weights accumulate ~{getattr(config, 'num_loops', '?')}× "
-                    f"gradient — the per-group grad_clip may be silently "
-                    f"crushing body updates. "
-                    f"Raise --grad-clip or scale body LR down."
-                ),
-            ))
+            if key not in self._issued:
+                self._issued.add(key)
+                issues.append(_Issue(
+                    key=key, severe=True,
+                    message=(
+                        f"Body grad norm ({avg_body:.3f}) is "
+                        f"{ratio_be:.1f}× entry ({avg_entry:.3f}). "
+                        f"Shared body weights accumulate ~{getattr(config, 'num_loops', '?')}× "
+                        f"gradient — the per-group grad_clip may be silently "
+                        f"crushing body updates. "
+                        f"Raise --grad-clip or scale body LR down."
+                    ),
+                ))
         elif ratio_be > GRAD_RATIO_WARN:
-            issues.append(_Issue(
-                key=key, severe=False,
-                message=(
-                    f"Body grad norm ({avg_body:.3f}) is "
-                    f"{ratio_be:.1f}× entry ({avg_entry:.3f}) — "
-                    f"expected asymmetry from loop sharing."
-                ),
-            ))
+            if key not in self._issued:
+                self._issued.add(key)
+                issues.append(_Issue(
+                    key=key, severe=False,
+                    message=(
+                        f"Body grad norm ({avg_body:.3f}) is "
+                        f"{ratio_be:.1f}× entry ({avg_entry:.3f}) — "
+                        f"expected asymmetry from loop sharing "
+                        f"(num_loops={getattr(config, 'num_loops', '?')}). "
+                        f"Monitor for growth above {GRAD_RATIO_WARN:.0f}×."
+                    ),
+                ))
         else:
             self._issued.discard(key)
 
