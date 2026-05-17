@@ -115,6 +115,7 @@ SKIP_RATE_ALERT = 0.10
 # PPL plateau detection: no improvement in loss for N diagnostic intervals.
 PLATEAU_PATIENCE = 10          # number of intervals
 PLATEAU_MIN_IMPROVEMENT = 0.001  # minimum absolute loss improvement
+PLATEAU_COOLDOWN_STEPS = 500   # don't re-alert within this many steps
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +135,7 @@ class DiagnosticsMonitor:
     # Internal state for rate-limiting and plateau detection
     _issued: Set[str] = field(default_factory=set, repr=False)
     _loss_history: List[float] = field(default_factory=list, repr=False)
+    _last_plateau_step: int = field(default=-PLATEAU_COOLDOWN_STEPS, repr=False)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -183,7 +185,6 @@ class DiagnosticsMonitor:
 
         # Format
         if not issues:
-            self._maybe_reset_plateau(loss_val, step)
             return []
 
         lines: List[str] = [f"[diag @ step {step}]"]
@@ -211,14 +212,17 @@ class DiagnosticsMonitor:
             return []
         key = "proj_near_zero"
         if avg < PROJ_WARN_ABS_MEAN:
-            return [_Issue(
-                key=key, severe=False,
-                message=(
-                    f"BlockAttentionResidual proj mean |w| = {avg:.2e} — "
-                    f"routing remains near-uniform. Expected >> 0 after "
-                    f"step {PROJ_WARN_AFTER_STEP}."
-                ),
-            )]
+            if key not in self._issued:
+                self._issued.add(key)
+                return [_Issue(
+                    key=key, severe=False,
+                    message=(
+                        f"BlockAttentionResidual proj mean |w| = {avg:.2e} — "
+                        f"routing remains near-uniform. Expected >> 0 after "
+                        f"step {PROJ_WARN_AFTER_STEP}."
+                    ),
+                )]
+            return []
         self._issued.discard(key)
         return []
 
@@ -238,15 +242,18 @@ class DiagnosticsMonitor:
             return []
         key = "out_up_near_zero"
         if avg < OUT_UP_WARN_ABS_MEAN:
-            return [_Issue(
-                key=key, severe=False,
-                message=(
-                    f"SnapshotRetrieval out_up mean |w| = {avg:.2e} — "
-                    f"memory branch still near-zero. Was initialised at "
-                    f"1e-3 (Logos) or 0 (hybrid). If 0-initialised, try "
-                    f"setting a small nonzero init in the model __init__."
-                ),
-            )]
+            if key not in self._issued:
+                self._issued.add(key)
+                return [_Issue(
+                    key=key, severe=False,
+                    message=(
+                        f"SnapshotRetrieval out_up mean |w| = {avg:.2e} — "
+                        f"memory branch still near-zero. Was initialised at "
+                        f"1e-3 (Logos) or 0 (hybrid). If 0-initialised, try "
+                        f"setting a small nonzero init in the model __init__."
+                    ),
+                )]
+            return []
         self._issued.discard(key)
         return []
 
@@ -291,31 +298,35 @@ class DiagnosticsMonitor:
         else:
             self._issued.discard(key_a_hi)
 
-        # B gate: warn if still near zero after warmup
+        # B gate: warn if still near zero after warmup (deduped)
         key_b_lo = "gate_B_zero"
         if step > GATE_B_WARN_AFTER_STEP and b_abs.mean().item() < GATE_B_WARN_ABS_MEAN:
-            issues.append(_Issue(
-                key=key_b_lo, severe=False,
-                message=(
-                    f"Body B per-channel gate mean |B| = {b_abs.mean().item():.2e} — "
-                    f"still near zero after step {step}. The injection signal 'e' "
-                    f"may be ineffective. Try --body-gate-init-std 0.02."
-                ),
-            ))
+            if key_b_lo not in self._issued:
+                self._issued.add(key_b_lo)
+                issues.append(_Issue(
+                    key=key_b_lo, severe=False,
+                    message=(
+                        f"Body B per-channel gate mean |B| = {b_abs.mean().item():.2e} — "
+                        f"still near zero after step {step}. The injection signal 'e' "
+                        f"may be ineffective. Try --body-gate-init-std 0.02."
+                    ),
+                ))
         else:
             self._issued.discard(key_b_lo)
 
-        # A gate: warn if still zero (symmetry never broken)
+        # A gate: warn if still zero (symmetry never broken) — deduped
         key_a_zero = "gate_A_zero"
         if step > GATE_B_WARN_AFTER_STEP and a_abs.mean().item() < GATE_B_WARN_ABS_MEAN:
-            issues.append(_Issue(
-                key=key_a_zero, severe=False,
-                message=(
-                    f"Body A per-channel gate mean |A| = {a_abs.mean().item():.2e} — "
-                    f"still near zero after step {step}. Residual mixing is INERT. "
-                    f"Try --body-gate-init-std 0.02."
-                ),
-            ))
+            if key_a_zero not in self._issued:
+                self._issued.add(key_a_zero)
+                issues.append(_Issue(
+                    key=key_a_zero, severe=False,
+                    message=(
+                        f"Body A per-channel gate mean |A| = {a_abs.mean().item():.2e} — "
+                        f"still near zero after step {step}. Residual mixing is INERT. "
+                        f"Try --body-gate-init-std 0.02."
+                    ),
+                ))
         else:
             self._issued.discard(key_a_zero)
 
@@ -572,24 +583,26 @@ class DiagnosticsMonitor:
 
         key = "ppl_plateau"
         if improvement < PLATEAU_MIN_IMPROVEMENT and newest > 0.5:
-            ppl = math.exp(min(newest, 20))
-            issues.append(_Issue(
-                key=key, severe=True,
-                message=(
-                    f"Loss plateau detected: no improvement in "
-                    f"{PLATEAU_PATIENCE} intervals "
-                    f"(loss {oldest:.3f} → {newest:.3f}, PPL ≈ {ppl:.1f}). "
-                    f"See checklist in diagnose_plateau.md or try: "
-                    f"--body-gate-init-std 0.02, reduce --num-loops, "
-                    f"raise --bias-update-rate."
-                ),
-            ))
+            # Cooldown: don't re-alert within PLATEAU_COOLDOWN_STEPS.
+            if step - self._last_plateau_step >= PLATEAU_COOLDOWN_STEPS:
+                ppl = math.exp(min(newest, 20))
+                issues.append(_Issue(
+                    key=key, severe=True,
+                    message=(
+                        f"Loss plateau detected: no improvement in "
+                        f"{PLATEAU_PATIENCE} intervals "
+                        f"(loss {oldest:.3f} → {newest:.3f}, PPL ≈ {ppl:.1f}). "
+                        f"See checklist in diagnose_plateau.md or try: "
+                        f"--body-gate-init-std 0.02, reduce --num-loops, "
+                        f"raise --bias-update-rate."
+                    ),
+                ))
+                self._last_plateau_step = step
+            # Always clear history after a plateau is detected — the
+            # next PLATEAU_PATIENCE intervals will form a fresh window.
+            self._loss_history.clear()
         else:
             self._issued.discard(key)
-
-        # Reset periodically to avoid stale warnings.
-        if improvement >= PLATEAU_MIN_IMPROVEMENT:
-            self._loss_history.clear()
 
         return issues
 
@@ -638,12 +651,6 @@ class DiagnosticsMonitor:
                             ))
                             break  # one warning per group is enough
         return issues
-
-    def _maybe_reset_plateau(self, loss_val: float, step: int):
-        """Clear plateau state if loss is improving."""
-        if math.isfinite(loss_val):
-            self._loss_history.clear()
-
 
 # ---------------------------------------------------------------------------
 # Helpers

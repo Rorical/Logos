@@ -1696,6 +1696,7 @@ def run_step_training(
     running_count = 0
     nonfinite_skips = 0
     nonfinite_warned = False
+    running_avg = float("nan")   # smoothed loss for diagnostics
     step = start_step
     t0 = time.time()
     # ``initial`` aligns the bar with the resumed position, while ``total``
@@ -1860,10 +1861,9 @@ def run_step_training(
                 avg = running_loss / running_count
                 ppl = math.exp(min(avg, 20))
             else:
-                # Entire window was non-finite; surface that explicitly
-                # rather than dividing by zero.
                 avg = float("nan")
                 ppl = float("nan")
+            running_avg = avg  # save for diagnostics
             elapsed = time.time() - t0
             # Cluster-wide tokens/sec for the *current* run — counts only
             # post-resume steps so an old checkpoint doesn't inflate the
@@ -1917,13 +1917,13 @@ def run_step_training(
                 topk_indices=topk_indices,
                 config=model_config,
                 step=step,
-                loss_val=loss_val,
+                loss_val=running_avg,
                 nonfinite_skips=nonfinite_skips,
                 total_steps=total_steps,
             )
             if diag_lines:
                 for line in diag_lines:
-                    print(line)
+                    pbar.write(line)
 
         if (args.opt_state_log_every > 0
                 and step % args.opt_state_log_every == 0):
