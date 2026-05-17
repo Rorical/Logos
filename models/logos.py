@@ -298,6 +298,7 @@ class LogosTransformer(nn.Module):
         )
         self.final_norm = RMSNorm(config.d_model, eps=config.norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head.weight = self.token_emb.weight
 
         self._init_weights()
 
