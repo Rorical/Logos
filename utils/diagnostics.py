@@ -596,39 +596,47 @@ class DiagnosticsMonitor:
     def _check_opt_state(self, optimizer, step: int) -> List[_Issue]:
         """Brief optimizer state health checks."""
         issues: List[_Issue] = []
-        for g in optimizer.param_groups:
-            lr = g.get("lr", 0.0)
-            if lr <= 0:
-                name = g.get("name", "?")
-                issues.append(_Issue(
-                    key=f"opt_lr_zero_{name}", severe=True,
-                    message=(
-                        f"Optimizer group '{name}' has lr={lr} — "
-                        f"this param group will not update."
-                    ),
-                ))
-            # Warn if AdamW beta2 (exp_avg_sq) is blowing up
-            for p in g["params"]:
-                if p.grad is None:
-                    continue
-                state = optimizer.state.get(p)
-                if state is None:
-                    continue
-                exp_avg_sq = state.get("exp_avg_sq")
-                if exp_avg_sq is not None and isinstance(exp_avg_sq, torch.Tensor):
-                    esq_max = exp_avg_sq.max().item()
-                    if esq_max > 100.0:
-                        name = g.get("name", "?")
-                        issues.append(_Issue(
-                            key=f"opt_esq_high_{name}", severe=False,
-                            message=(
-                                f"AdamW exp_avg_sq max = {esq_max:.1f} in "
-                                f"group '{name}' — large second moment suggests "
-                                f"gradient spikes. Consider reducing LR or "
-                                f"increasing grad_clip."
-                            ),
-                        ))
-                        break  # one warning per group is enough
+
+        # MultiOptimizer (train.py) wraps several optimizers; iterate them.
+        inner_opts: list = getattr(optimizer, "optimizers", [optimizer])
+
+        for opt in inner_opts:
+            for g in opt.param_groups:
+                lr = g.get("lr", 0.0)
+                initial_lr = g.get("initial_lr", lr)
+                # lr=0 during warmup is normal (scheduler hasn't ramped yet);
+                # only warn if initial_lr itself is zero or negative.
+                if initial_lr <= 0:
+                    name = g.get("name", "?")
+                    issues.append(_Issue(
+                        key=f"opt_lr_zero_{name}", severe=True,
+                        message=(
+                            f"Optimizer group '{name}' has initial_lr={initial_lr} — "
+                            f"this param group will never update."
+                        ),
+                    ))
+                # Warn if AdamW beta2 (exp_avg_sq) is blowing up
+                for p in g["params"]:
+                    if p.grad is None:
+                        continue
+                    state = opt.state.get(p)
+                    if state is None:
+                        continue
+                    exp_avg_sq = state.get("exp_avg_sq")
+                    if exp_avg_sq is not None and isinstance(exp_avg_sq, torch.Tensor):
+                        esq_max = exp_avg_sq.max().item()
+                        if esq_max > 100.0:
+                            name = g.get("name", "?")
+                            issues.append(_Issue(
+                                key=f"opt_esq_high_{name}", severe=False,
+                                message=(
+                                    f"AdamW exp_avg_sq max = {esq_max:.1f} in "
+                                    f"group '{name}' — large second moment suggests "
+                                    f"gradient spikes. Consider reducing LR or "
+                                    f"increasing grad_clip."
+                                ),
+                            ))
+                            break  # one warning per group is enough
         return issues
 
     def _maybe_reset_plateau(self, loss_val: float, step: int):
