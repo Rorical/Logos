@@ -37,6 +37,7 @@ from models.superlinear import SuperLinearConfig, SuperLinearTransformer
 from models.hybrid import HybridConfig, HybridTransformer
 from models.logos import LogosConfig, LogosTransformer
 from utils.tokenizer import TiktokenTokenizer
+from utils.diagnostics import DiagnosticsMonitor, print_model_diagnostic_summary
 
 
 # ---------------------------------------------------------------------------
@@ -1660,6 +1661,8 @@ def run_step_training(
     sample_text_fn,
     total_steps: int,
     start_step: int = 0,
+    diagnostic_monitor: Optional[Any] = None,
+    model_config: Any = None,
 ) -> Dict[str, Any]:
     """Step-bounded training. Mirrors the per-epoch path's per-step body
     (forward, backward, opt/sched/muon_hp, MoE bias update, EMA update)
@@ -1902,6 +1905,25 @@ def run_step_training(
             }, step=step)
             running_loss = 0.0
             running_count = 0
+
+        # --- Training-dynamics diagnostics ---
+        if (diagnostic_monitor is not None
+                and not diagnostic_monitor.disable
+                and step % diagnostic_monitor.every == 0
+                and main):
+            diag_lines = diagnostic_monitor.check(
+                raw_model=raw_model,
+                optimizer=optimizer,
+                topk_indices=topk_indices,
+                config=model_config,
+                step=step,
+                loss_val=loss_val,
+                nonfinite_skips=nonfinite_skips,
+                total_steps=total_steps,
+            )
+            if diag_lines:
+                for line in diag_lines:
+                    print(line)
 
         if (args.opt_state_log_every > 0
                 and step % args.opt_state_log_every == 0):
@@ -2228,6 +2250,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Linear warmup (0 -> 1 multiplier). Take 2-10%% "
                              "of total steps for the WSD recipe.")
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--diagnostic-every", type=int, default=100,
+                        help="Run training-dynamics diagnostics every N steps. "
+                             "0 disables. Diagnoses body-loop gradient ratios, "
+                             "BlockAttentionResidual routing, retrieval memory "
+                             "activation, MoE load collapse, and PPL plateaus. "
+                             "Negligible overhead (<5ms/check).")
 
     parser.add_argument("--scheduler", type=str, default="wsd",
                         choices=["wsd", "cosine"],
@@ -2618,6 +2646,19 @@ def main(args: Optional[argparse.Namespace] = None):
 
     raw_model = model
 
+    # ------------------------------------------------------------------
+    # Training-dynamics diagnostics monitor
+    # ------------------------------------------------------------------
+    diagnostic_monitor = DiagnosticsMonitor(
+        every=args.diagnostic_every,
+        disable=(args.diagnostic_every <= 0),
+    )
+    if main_proc and not diagnostic_monitor.disable:
+        print_model_diagnostic_summary(raw_model, config)
+    elif main_proc and diagnostic_monitor.disable:
+        print("  Diagnostics disabled (--diagnostic-every 0)")
+    # ------------------------------------------------------------------
+
     # Build EMA before torch.compile — AveragedModel snapshots the raw
     # parameter list, and the per-step update_parameters call inside
     # run_epoch hands it the same uncompiled instance via _orig_mod.
@@ -2726,6 +2767,7 @@ def main(args: Optional[argparse.Namespace] = None):
             args, model, raw_model, optimizer, scheduler, muon_hp, ema_model,
             train_loader, val_loader, device, use_amp, mp_dtype,
             save_dir, sample_text, total_steps, start_step=start_step,
+            diagnostic_monitor=diagnostic_monitor, model_config=config,
         )
         history = result["history"]
         best_val_loss = result["best_val_loss"]
@@ -2848,6 +2890,27 @@ def main(args: Optional[argparse.Namespace] = None):
                     [k for k in balance if "bias_mean" in k]
                 )
                 print(f"  MoE balance -> bias_mean: {bias_mean:.4f}, bias_max: {bias_max:.4f}")
+
+        # --- Training-dynamics diagnostics (per-epoch path) ---
+        if (main_proc
+                and not diagnostic_monitor.disable
+                and epoch % max(1, diagnostic_monitor.every // max(1, len(train_loader))) == 0):
+            # Per-epoch path doesn't expose per-step topk_indices, so MoE
+            # load checks are skipped; weight + gradient checks still run.
+            train_loss = train_metrics.get("loss", float("nan"))
+            diag_lines = diagnostic_monitor.check(
+                raw_model=raw_model,
+                optimizer=optimizer,
+                topk_indices=None,
+                config=config,
+                step=epoch,
+                loss_val=train_loss,
+                nonfinite_skips=0,
+                total_steps=args.epochs,
+            )
+            if diag_lines:
+                for line in diag_lines:
+                    print(line)
 
         if (args.sample_every > 0 and epoch % args.sample_every == 0
                 and main_proc):
