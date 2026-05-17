@@ -117,6 +117,12 @@ PLATEAU_PATIENCE = 10          # number of intervals
 PLATEAU_MIN_IMPROVEMENT = 0.001  # minimum absolute loss improvement
 PLATEAU_COOLDOWN_STEPS = 500   # don't re-alert within this many steps
 
+# Model capacity: warn when embedding dominates total params (no room for
+# the transformer body to learn anything beyond a lookup table).
+EMBED_FRACTION_WARN = 0.80     # embedding > 80% of params
+EMBED_FRACTION_ALERT = 0.90    # embedding > 90% of params
+BODY_PARAM_MIN = 500_000       # body < 500k params is too thin for 100k vocab
+
 
 # ---------------------------------------------------------------------------
 # Diagnostic monitor
@@ -167,6 +173,7 @@ class DiagnosticsMonitor:
         issues.extend(self._check_out_up(raw_model, step))
         issues.extend(self._check_ab_gates(raw_model, config, step))
         issues.extend(self._check_kda_params(raw_model, config, step))
+        issues.extend(self._check_capacity(raw_model, config, step))
 
         # --- Gradient inspections ---
         issues.extend(self._check_section_grads(raw_model, config, step))
@@ -396,6 +403,74 @@ class DiagnosticsMonitor:
 
         return issues
 
+    def _check_capacity(self, model, config, step: int) -> List[_Issue]:
+        """Warn if the model's parameter budget is skewed toward the embedding,
+        leaving too little capacity for the transformer body to learn."""
+        issues: List[_Issue] = []
+
+        total = 0
+        embed_n = 0
+        body_n = 0
+        for name, p in model.named_parameters():
+            n = p.numel()
+            total += n
+            if "token_emb" in name or "lm_head" in name:
+                embed_n += n
+            elif any(k in name for k in (".body.", ".entry.", ".exit.", "body.", "entry.", "exit.")):
+                body_n += n
+            elif "body." in name or "blocks." in name or "attn" in name.lower() or "ffn" in name.lower() or "moe" in name.lower():
+                body_n += n
+
+        if total == 0 or step <= 100:
+            return issues
+
+        embed_frac = embed_n / total
+
+        key = "embed_dominance"
+        if embed_frac > EMBED_FRACTION_ALERT:
+            if key not in self._issued:
+                self._issued.add(key)
+                issues.append(_Issue(
+                    key=key, severe=True,
+                    message=(
+                        f"Embedding is {embed_frac:.0%} of params ({embed_n:,}/{total:,}) — "
+                        f"transformer body has only {body_n:,} params. "
+                        f"The model is essentially a lookup table. "
+                        f"Increase d_model (>={int(embed_n ** 0.5):,}) or "
+                        f"use a smaller tokenizer."
+                    ),
+                ))
+        elif embed_frac > EMBED_FRACTION_WARN:
+            if key not in self._issued:
+                self._issued.add(key)
+                issues.append(_Issue(
+                    key=key, severe=False,
+                    message=(
+                        f"Embedding is {embed_frac:.0%} of params ({embed_n:,}/{total:,}) — "
+                        f"body has {body_n:,} params. "
+                        f"Consider larger d_model for this vocab size."
+                    ),
+                ))
+        else:
+            self._issued.discard(key)
+
+        if body_n > 0 and body_n < BODY_PARAM_MIN:
+            key_body = "body_too_small"
+            if key_body not in self._issued:
+                self._issued.add(key_body)
+                issues.append(_Issue(
+                    key=key_body, severe=True,
+                    message=(
+                        f"Transformer body has only {body_n:,} params — "
+                        f"below {BODY_PARAM_MIN:,} minimum for meaningful "
+                        f"learning. Increase d_model, num_body_layers, or d_ff."
+                    ),
+                ))
+        elif body_n >= BODY_PARAM_MIN:
+            self._issued.discard("body_too_small")
+
+        return issues
+
     def _check_section_grads(self, model, config, step: int) -> List[_Issue]:
         """Per-section (entry/body/exit) gradient norm comparison."""
         issues: List[_Issue] = []
@@ -586,15 +661,17 @@ class DiagnosticsMonitor:
             # Cooldown: don't re-alert within PLATEAU_COOLDOWN_STEPS.
             if step - self._last_plateau_step >= PLATEAU_COOLDOWN_STEPS:
                 ppl = math.exp(min(newest, 20))
+                # Build a hint about what's NOT wrong, to narrow down causes.
+                hints: list = []
+                hints.append("Check --diagnostic-every output above for root cause")
+                hints.append("try: --body-gate-init-std 0.02, reduce --num-loops, raise --bias-update-rate, or increase d_model")
                 issues.append(_Issue(
                     key=key, severe=True,
                     message=(
                         f"Loss plateau detected: no improvement in "
                         f"{PLATEAU_PATIENCE} intervals "
                         f"(loss {oldest:.3f} → {newest:.3f}, PPL ≈ {ppl:.1f}). "
-                        f"See checklist in diagnose_plateau.md or try: "
-                        f"--body-gate-init-std 0.02, reduce --num-loops, "
-                        f"raise --bias-update-rate."
+                        + " ".join(hints)
                     ),
                 ))
                 self._last_plateau_step = step
