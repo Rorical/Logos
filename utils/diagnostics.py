@@ -113,9 +113,10 @@ SKIP_RATE_WARN = 0.01
 SKIP_RATE_ALERT = 0.10
 
 # PPL plateau detection: no improvement in loss for N diagnostic intervals.
-PLATEAU_PATIENCE = 10          # number of intervals
+PLATEAU_PATIENCE = 20              # number of diagnostic intervals
 PLATEAU_MIN_IMPROVEMENT = 0.001  # minimum absolute loss improvement
 PLATEAU_COOLDOWN_STEPS = 500   # don't re-alert within this many steps
+PLATEAU_MIN_STEP = 2000         # don't flag plateau before this step
 
 # Model capacity: warn when embedding dominates total params (no room for
 # the transformer body to learn anything beyond a lookup table).
@@ -539,9 +540,6 @@ class DiagnosticsMonitor:
         else:
             self._issued.discard(key)
 
-        if ratio_bx is not None and ratio_bx > GRAD_RATIO_WARN:
-            self._issued.discard(key)  # already warned via body/entry
-
         return issues
 
     def _check_moe_load(
@@ -581,7 +579,7 @@ class DiagnosticsMonitor:
         global_max = max(max_loads)
         key = "moe_load_collapse"
 
-        if global_max > MOE_MAX_LOAD_ALERT:
+        if global_max >= MOE_MAX_LOAD_ALERT:
             issues.append(_Issue(
                 key=key, severe=True,
                 message=(
@@ -652,8 +650,8 @@ class DiagnosticsMonitor:
         if len(self._loss_history) < PLATEAU_PATIENCE:
             return issues
 
-        # Only flag plateau if we're well past warmup.
-        if step < 500:
+        # Only flag plateau if we're well past warmup and early training.
+        if step < PLATEAU_MIN_STEP:
             self._loss_history.clear()
             return issues
 
