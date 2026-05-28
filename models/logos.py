@@ -209,7 +209,7 @@ class LogosTransformerBlock(nn.Module):
     def forward(
         self,
         blocks: List[torch.Tensor],
-        partial: torch.Tensor,
+        partial: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         is_causal: bool = True,
         cache: Optional[Dict[str, Any]] = None,
@@ -220,13 +220,19 @@ class LogosTransformerBlock(nn.Module):
             attn_out = self.attn(
                 self.attn_norm(h), attention_mask=attention_mask, is_causal=is_causal,
             )
-            partial = partial + attn_out
+            if partial is None:
+                partial = attn_out
+            else:
+                partial = partial + attn_out
         else:
             h = self.kda_res(blocks, partial)
             kda_out, snapshots, snap_positions = self.kda(
                 self.kda_norm(h), attention_mask=attention_mask, cache=cache,
             )
-            partial = partial + kda_out
+            if partial is None:
+                partial = kda_out
+            else:
+                partial = partial + kda_out
 
             h = self.mem_res(blocks, partial)
             if cache is not None:
@@ -361,14 +367,9 @@ class LogosTransformer(nn.Module):
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []
 
-        # Block outputs require_grad in training, so seed ``partial`` with the
-        # same flag at every reset. Otherwise Dynamo recompiles the body /
-        # exit call sites whenever ``partial`` flips from a fresh ``zeros_like``
-        # (False) to a block output (True), and burns through the recompile
-        # budget.
-        zero_partial = lambda: torch.zeros_like(x, requires_grad=x.requires_grad)
         blocks: List[torch.Tensor] = [x]
-        partial = zero_partial()
+        # Per paper Eq. 6: the first block starts with no accumulated partial.
+        partial: Optional[torch.Tensor] = None
 
         # Recompute placement is asymmetric. Entry / exit are small and
         # always run un-checkpointed so torch.compile can fuse them; the
@@ -419,14 +420,19 @@ class LogosTransformer(nn.Module):
                     attention_mask=attention_mask, is_causal=is_causal,
                     cache=None, loop_idx=loop_idx,
                 )
+            # XLA checkpoint expects all-tensor args; None (block boundary)
+            # is a non-tensor and can't be checkpointed — run directly.
+            if partial_in is None:
+                return _fn(*blocks_in, None)
             return _xla_checkpoint(_fn, *blocks_in, partial_in)
 
         for layer in self.entry:
             partial, layer_aux, layer_topk = _call_block(layer, blocks, partial, 0)
             aux_loss = aux_loss + layer_aux
             topk_indices_list.append(layer_topk)
+        assert partial is not None, "entry produced no partial block"
         blocks = blocks + [partial]
-        partial = zero_partial()
+        partial = None
 
         for loop_idx in range(self.config.num_loops):
             if per_loop_ckpt:
@@ -440,7 +446,7 @@ class LogosTransformer(nn.Module):
                 # per-block append order used by ``update_router_biases``.
                 _li = loop_idx
                 def _body_loop(blks, p):
-                    aux_sum = torch.zeros((), device=p.device, dtype=p.dtype)
+                    aux_sum = torch.zeros((), device=p.device, dtype=p.dtype) if p is not None else torch.zeros((), device=blks[0].device, dtype=blks[0].dtype)
                     topks: List[Optional[torch.Tensor]] = []
                     for block in self.body:
                         p, la, lt = block(
@@ -471,14 +477,16 @@ class LogosTransformer(nn.Module):
                     )
                     aux_loss = aux_loss + layer_aux
                     topk_indices_list.append(layer_topk)
+            assert partial is not None, f"body loop {loop_idx} produced no partial block"
             blocks = blocks + [partial]
-            partial = zero_partial()
+            partial = None
 
         for layer in self.exit:
             partial, layer_aux, layer_topk = _call_block(layer, blocks, partial, 0)
             aux_loss = aux_loss + layer_aux
             topk_indices_list.append(layer_topk)
 
+        # final_res handles None partial: only attends over completed blocks.
         h_main = self.final_res(blocks, partial)
         x = self.final_norm(h_main)
         use_chunked_lm_loss = (

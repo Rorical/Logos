@@ -137,12 +137,24 @@ class BlockAttentionResidual(nn.Module):
     def forward(
         self,
         blocks: List[torch.Tensor],
-        partial_block: torch.Tensor,
+        partial_block: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if len(blocks) == 0:
+            if partial_block is None:
+                raise ValueError(
+                    "BlockAttentionResidual received zero blocks and "
+                    "partial_block=None — nothing to attend over."
+                )
             return partial_block
 
-        values = torch.stack(blocks + [partial_block], dim=0)
+        # Per Eq. 6: the first layer of a block attends only over
+        # completed blocks + embedding; the (still-empty) partial is
+        # excluded.  The caller signals this by passing None.
+        if partial_block is None:
+            values = torch.stack(blocks, dim=0)
+        else:
+            values = torch.stack(blocks + [partial_block], dim=0)
+
         keys = self.norm(values)
         # Dot keys against a 1D weight; keepdim=True so the broadcast
         # against ``values`` doesn't need a separate unsqueeze.
@@ -177,13 +189,16 @@ class ResidualTransformerBlock(nn.Module):
     def forward(
         self,
         blocks: List[torch.Tensor],
-        partial_block: torch.Tensor,
+        partial_block: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         is_causal: bool = True,
     ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         h = self.attn_res(blocks, partial_block)
         attn_out = self.attn(self.attn_norm(h), attention_mask=attention_mask, is_causal=is_causal)
-        partial_block = partial_block + attn_out
+        if partial_block is None:
+            partial_block = attn_out
+        else:
+            partial_block = partial_block + attn_out
 
         h = self.ffn_res(blocks, partial_block)
         if self.use_moe:
@@ -246,9 +261,10 @@ class ResidualTransformer(nn.Module):
         x = self.token_emb(input_ids)
         x = self.dropout(x)
 
-        # Embedding is "block 0"; partial accumulates a fresh block.
+        # Embedding is "block 0"; the first block starts with no
+        # accumulated partial (None), matching paper Eq. 6.
         blocks: List[torch.Tensor] = [x]
-        partial_block = torch.zeros_like(x)
+        partial_block: Optional[torch.Tensor] = None
 
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []
@@ -256,8 +272,11 @@ class ResidualTransformer(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             # Non-in-place block-list update for compile/checkpointing safety.
             if self._is_block_boundary(layer_idx):
+                assert partial_block is not None, (
+                    f"partial_block is None at block boundary layer {layer_idx}"
+                )
                 blocks = blocks + [partial_block]
-                partial_block = torch.zeros_like(partial_block)
+                partial_block = None
 
             blocks, partial_block, layer_aux, layer_topk = layer(
                 blocks,
@@ -268,6 +287,9 @@ class ResidualTransformer(nn.Module):
             aux_loss = aux_loss + layer_aux
             topk_indices_list.append(layer_topk)
 
+        # final_res expects the full (blocks + partial) stack.  If the
+        # last iteration landed on a block boundary partial_block may be
+        # None; in that case we only attend over completed blocks.
         x = self.final_res(blocks, partial_block)
         x = self.final_norm(x)
         logits = self.lm_head(x)
