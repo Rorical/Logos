@@ -1,117 +1,127 @@
 # Logos
 
-A sub-quadratic decoder-only transformer.
+A decoder-only language-model playground centered on **Logos**, a looped hybrid-attention transformer.
 
-Each parameter-block is one of two kinds:
+Logos now uses direct attention variants only:
 
-- **KDA + Retrieval** Kimi Delta Attention scan, followed by sparse top-k attention over MLA-compressed state snapshots.
-- **Local SWA** Causal sliding-window softmax attention with a fixed window of `swa_window` tokens.
+- **KDA** Kimi Delta Attention recurrent/chunkwise scan.
+- **SWA** causal sliding-window softmax attention.
+- **CSA** DeepSeek-V4-style compressed sparse global attention: learned 4-token KV compression, first-stage indexer scoring, then full attention over top-k compressed entries.
+- **HCA** DeepSeek-V4-style heavily compressed global attention: learned large-ratio KV compression, then dense attention over all compressed entries.
 
-Block kind is determined structurally by `layer_idx % swa_every == swa_offset`.
+The old snapshot-memory path and `superlinear` model variant have been removed.
 
-The model is partitioned into three sections — **Entry → Body → Exit** — where the Body is `num_body_layers` shared-weight blocks reused `num_loops` times per forward. Sublayer inputs are computed by Block Attention Residual: a learned depth-wise softmax over the list of completed-block representations and the current partial sum. Section and loop boundaries close partial sums into new completed blocks; a final Block Attention Residual produces the LM-head input.
+## Logos Layout
 
-Body MoE layers carry per-loop router-bias rows and a cross-loop expert-diversity term (`moe_diversity_factor`), so shared weights specialise differently across loop iterations.
-
-The repository also ships six ancestor variants — `baseline`, `linear`, `recursive`, `residual`, `superlinear`, `hybrid` — usable on their own and serving as ablation references for Logos.
-
-## Block list
-
-The depth-wise softmax inside every sublayer attends over an evolving `blocks` list whose entries correspond to natural model boundaries:
+The model is partitioned into three sections:
 
 ```text
-block 0      : token embedding (after dropout)
-block 1      : entry output
-blocks 2..L+1: each loop iteration's closed state (L = num_loops)
-final        : exit's partial accumulation, fed through one more
-               BlockAttentionResidual to produce the lm_head input
+Entry -> Body x num_loops -> Exit
 ```
 
-| Sublayer | KDA blocks | SWA blocks |
-| --- | --- | --- |
-| Attention input | `kda_res(blocks, partial)` → `SuperKimiDeltaAttention` | `attn_res(blocks, partial)` → `LocalAttention` |
-| Memory input | `mem_res(blocks, partial)` → `SnapshotRetrieval` | — |
-| FFN input | `ffn_res(blocks, partial)` → `MoELayer` / `SwiGLU` | `ffn_res(blocks, partial)` → `MoELayer` / `SwiGLU` |
+Entry and Exit run once. Body is a shared-weight stack reused `num_loops` times per forward pass.
 
-## Initialization
+Sublayer inputs use Block Attention Residual: a learned depth-wise softmax over completed block representations plus the current partial block. Section and loop boundaries close partial sums into the completed-block list, and a final Block Attention Residual produces the LM-head input.
 
-Initialization is chosen so the model behaves like a familiar baseline at step 0:
+```text
+block 0      : token embedding after dropout
+block 1      : entry output
+blocks 2..L+1: each body loop output, L = num_loops
+final        : exit partial plus completed blocks -> final_res -> lm_head
+```
 
-- `BlockAttentionResidual.proj` is zero-initialised, so each depth-wise softmax starts uniform and matches a standard residual sum in expectation.
-- `SnapshotRetrieval.out_up` is zero-initialised, so the memory branch is an exact no-op at step 0.
+## Attention Scheduling
 
-## Ancestor variants
+Every Logos block can execute `kda`, `swa`, `csa`, or `hca`.
 
-Each ancestor lives in its own file and is a usable model in its own right. Logos imports concrete pieces from each rather than copying code:
+Fine-grained schedules are comma- or semicolon-separated patterns:
 
-| Variant | Contributes to Logos |
-| --- | --- |
-| `baseline` | `RMSNorm`, `SwiGLU`, `MoELayer` (per-loop bias rows + cross-loop diversity), shared MoE static-shape dispatch |
-| `linear` | Kimi Delta Attention primitives (`_ShortConvolution`, `_kda_gate`, `_kda_recurrent_step`) |
-| `superlinear` | `SuperKimiDeltaAttention` (KDA + state snapshots), `SnapshotRetrieval` (sparse top-k attention over MLA-compressed latents) |
-| `hybrid` | `HybridConfig` (parent of `LogosConfig`), `LocalAttention` for SWA layers |
-| `recursive` | The Entry / Body / Exit looped-depth orchestration |
-| `residual` | `BlockAttentionResidual` (depth-wise softmax over completed-block representations + partial) |
+- `--entry-attn-pattern`: expanded across `num_entry_layers`.
+- `--body-attn-pattern`: expanded across `num_loops * num_body_layers` in loop-major order.
+- `--exit-attn-pattern`: expanded across `num_exit_layers`.
+- `--attn-pattern`: global fallback for Hybrid, and for Logos when section-specific patterns are unset.
 
-## Architecture options shared across variants
+Example body order for `num_body_layers=4`, `num_loops=3`:
 
-- **Q/K RMSNorm** (`qk_norm`): per-head RMSNorm on Q and K before scoring. Default on; KDA already L2-normalises q/k inside the chunkwise scan.
-- **Partial RoPE** (`partial_rope_dim`): rotate only the last *N* channels per head, leaving the rest as content-only features. Default `None` (full rotation).
-- **Attention sink** (`attention_sink`): per-head learnable logit appended to the softmax denominator (StreamingLLM / GPT-OSS-style). Default on.
-- **MoE static dispatch**: expert assignment uses `(positions × is_first).cummax` + sentinel-column scatter — no `nonzero`, no boolean indexing, no graph breaks under `torch.compile`.
-- **NTK / YaRN scaling** (retrieval RoPE): three modes (`none` / `ntk` / `yarn`) for long-context extrapolation. YaRN uses the corrected pair-index clamp (the fix for the unit error in the original / HF YaRN reference).
+```text
+loop0.block0, loop0.block1, loop0.block2, loop0.block3,
+loop1.block0, loop1.block1, loop1.block2, loop1.block3,
+loop2.block0, loop2.block1, loop2.block2, loop2.block3
+```
 
-## Project structure
+If no explicit pattern is provided, Logos preserves the old structural KDA/SWA schedule controlled by `swa_every` and `swa_offset`.
+
+## Architecture Options
+
+- `--csa-compression`: CSA compression ratio, default `4`.
+- `--csa-top-k`: CSA sparse recall top-k over compressed entries, default `1024`.
+- `--csa-indexer-heads`: CSA first-stage indexer heads, default `4`.
+- `--csa-indexer-dim`: CSA first-stage indexer head dimension, default `32`.
+- `--hca-compression`: HCA compression ratio, default `128`.
+- `--compressed-head-dim`: CSA/HCA shared-KV per-head dimension, default `--head-dim`.
+- `--compressed-query-dim`: CSA/HCA low-rank query bottleneck, default `--compressed-head-dim`.
+- `--swa-window`: SWA local window, default `256`.
+- `--chunk-size`: KDA chunk size.
+
+Shared options across variants include Q/K RMSNorm, partial RoPE for standard attention, attention sink logits, MoE static dispatch, and optional Block Attention Residual softmax isolation for `torch.compile` stability on SMEM-constrained GPUs.
+
+## Project Structure
 
 ```text
 logos/
 ├── models/
-│   ├── baseline.py        # BaselineTransformer + shared building blocks
-│   ├── linear.py          # LinearTransformer (Kimi Delta Attention)
-│   ├── recursive.py       # RecursiveTransformer (looped depth)
-│   ├── residual.py        # ResidualTransformer (Block AttnRes)
-│   ├── superlinear.py     # SuperLinearTransformer (KDA + snapshot memory)
-│   ├── hybrid.py          # HybridTransformer (KDA + snapshot + local SWA)
-│   └── logos.py           # LogosTransformer
+│   ├── baseline.py     # BaselineTransformer + shared RMSNorm/RoPE/MoE pieces
+│   ├── linear.py       # LinearTransformer with Kimi Delta Attention
+│   ├── recursive.py    # RecursiveTransformer with looped body depth
+│   ├── residual.py     # ResidualTransformer + BlockAttentionResidual
+│   ├── hybrid.py       # KDA/SWA/CSA/HCA HybridTransformer pieces
+│   └── logos.py        # LogosTransformer
 ├── scripts/
-│   ├── train.py           # Unified causal LM training, --model {baseline, linear, ...}
-│   ├── train_xla.py       # TPU/XLA training with the same model/dataset/checkpoint flags
-│   └── train_chat.py      # ChatML-formatted fine-tune (assistant-only loss masking)
-├── notebooks/
-│   ├── train_colab.ipynb  # 1 B-MoE bake-off across all seven variants on A100
-│   ├── pretrain_logos_colab.ipynb  # Blackwell GPU pretraining wrapper
-│   └── pretrain_logos_tpu_v6e_colab.ipynb  # TPU v6e/XLA pretraining wrapper
+│   ├── train.py        # Unified causal LM training
+│   ├── train_xla.py    # TPU/XLA wrapper over train.py
+│   └── train_chat.py   # ChatML fine-tuning for baseline/linear/recursive
+├── notebooks/          # Colab wrappers and bake-off notebooks
 ├── utils/
-│   └── tokenizer.py       # Tiktoken wrapper with ChatML support
-├── pyproject.toml         # uv-managed dependencies
+│   ├── diagnostics.py  # Training diagnostics
+│   └── tokenizer.py    # Tiktoken wrapper with ChatML support
+├── pyproject.toml
 └── README.md
 ```
 
-## Quick start
+## Quick Start
 
-Constructing a Logos model directly:
+Construct a Logos model directly:
 
 ```python
 from models.logos import LogosConfig, LogosTransformer
 
 cfg = LogosConfig(
-    vocab_size=32000, d_model=512, num_heads=8, head_dim=64,
-    num_entry_layers=2, num_body_layers=4, num_exit_layers=2,
+    vocab_size=32000,
+    d_model=512,
+    num_heads=8,
+    head_dim=64,
+    num_entry_layers=2,
+    num_body_layers=4,
+    num_exit_layers=2,
     num_loops=4,
-    swa_every=4, swa_offset=3, swa_window=256,
-    chunk_size=64, snapshot_interval=256,
-    snapshot_latent_dim=128, mem_top_k=16, mem_head_dim=64, mem_latent_dim=128,
-    use_moe=True, num_sparse_experts=64, top_k=6, expert_d_ff=256,
-    moe_diversity_factor=0.05,
+    entry_attn_pattern="hca,kda",
+    body_attn_pattern="hca,csa,kda,swa,csa,csa,kda,swa",
+    exit_attn_pattern="csa,swa",
+    csa_compression=4,
+    csa_top_k=64,
+    hca_compression=128,
+    use_moe=True,
+    num_sparse_experts=64,
+    top_k=6,
+    expert_d_ff=256,
 )
 model = LogosTransformer(cfg)
 out = model(input_ids, attention_mask=attention_mask, labels=labels)
 
-# After optimizer.step(), update the bias-balancing routers:
 model.update_router_biases(out["topk_indices"])
 ```
 
-End-to-end training via `scripts/train.py --model logos`:
+Train from the CLI:
 
 ```bash
 uv sync
@@ -121,52 +131,35 @@ uv run python scripts/train.py \
     --dataset tiny_shakespeare \
     --d-model 512 --num-heads 8 --head-dim 64 \
     --num-entry-layers 2 --num-body-layers 4 \
-        --num-exit-layers 2 --num-loops 4 \
-    --snapshot-interval 256 --snapshot-latent-dim 128 \
-        --mem-top-k 16 --mem-head-dim 64 \
-    --swa-every 4 --swa-offset 3 --swa-window 256 \
+    --num-exit-layers 2 --num-loops 4 \
+    --entry-attn-pattern hca,kda \
+    --body-attn-pattern hca,csa,kda,swa,csa,csa,kda,swa \
+    --exit-attn-pattern csa,swa \
+    --csa-compression 4 --csa-top-k 64 \
+    --hca-compression 128 --swa-window 256 \
     --use-moe --num-sparse-experts 64 --top-k 6 \
-        --moe-diversity-factor 0.5 \
     --batch-size 4 --epochs 20 --lr 3e-4
 ```
 
-`scripts/train.py --help` lists every flag (per-variant flags are gated to the relevant `--model`).
+`scripts/train.py --help` lists all flags.
 
-TPU training uses the same CLI through `scripts/train_xla.py` and should be run
-on a TPU VM with a PyTorch/XLA build matching the installed PyTorch version:
+## Variants
 
-```bash
-PJRT_DEVICE=TPU uv run python scripts/train_xla.py \
-    --model logos \
-    --dataset tiny_shakespeare \
-    --bf16 \
-    --batch-size 4 --epochs 20 --lr 3e-4
-```
+The training registry currently includes:
 
-The XLA driver keeps the standard observability and artifact flow: rank-0 W&B
-logging, EMA validation, MoE load histograms, rolling checkpoints,
-`history.json`, and final checkpoints. `--compile` is ignored because XLA
-performs lazy device compilation.
+- `baseline`
+- `linear`
+- `recursive`
+- `residual`
+- `hybrid`
+- `logos`
 
-## Bake-off notebook
-
-`notebooks/train_colab.ipynb` runs all seven variants at ~1 B parameters with matched MoE settings on WikiText-103, then loads each run's `runs/<name>/history.json` and produces a side-by-side loss-curve plot. Each variant uses `--no-save` so only the lightweight `history.json` files are written; drop the flag to keep weights.
-
-## torch.compile compatibility
-
-The training forward and backward compile cleanly under `torch.compile` with `--compile`:
-
-- MoE expert dispatch uses static-shape scatter (sentinel-column trick) — no `nonzero`, no boolean indexing.
-- KDA chunkwise scan is loop-unrolled at compile time; snapshot emission inside the scan is a compile-time-resolved condition.
-- `RotaryEmbedding.forward` raises a clear error when `seq_len > max_seq_len` instead of silently truncating.
-- `BlockAttentionResidual` is a thin `RMSNorm + Linear(D, 1) + softmax`; softmax runs in fp32 for stability.
-
-Inference and cached generation (KV cache for SWA, recurrent state for KDA, growing snapshot history for retrieval) fall back to eager. Logos's `generate()` does naive re-forward across the growing prefix; per-step cache reuse is not implemented because the body re-runs its KDA scan on every loop iteration.
+`hybrid` is a non-looped stack using the same `kda/swa/csa/hca` attention modules. `logos` adds Entry/Body/Exit looping plus Block Attention Residuals.
 
 ## Requirements
 
-- Python ≥ 3.13
-- PyTorch with CUDA support for GPU training, or a matching PyTorch/XLA build for TPU training
+- Python >= 3.13
+- PyTorch with CUDA support for GPU training, or matching PyTorch/XLA for TPU training
 - `uv` for dependency management
 
 ## License

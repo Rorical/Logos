@@ -139,8 +139,7 @@ class RotaryEmbedding(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
     def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
-        # Fail loudly when slicing the cos/sin table would silently truncate;
-        # see SnapshotRetrieval._apply_rope for a tableless variant.
+        # Fail loudly when slicing the cos/sin table would silently truncate.
         if seq_len > self.max_seq_len:
             raise ValueError(
                 f"RotaryEmbedding: seq_len ({seq_len}) exceeds the "

@@ -85,10 +85,6 @@ GRAD_RATIO_ALERT = 5.0
 PROJ_WARN_ABS_MEAN = 1e-4    # |proj| < this → warn
 PROJ_WARN_AFTER_STEP = 200   # only after this many steps
 
-# SnapshotRetrieval ``out_up`` near zero → memory branch is a no-op.
-OUT_UP_WARN_ABS_MEAN = 1e-4   # was initialised at 1e-3 (Logos) or 0 (hybrid)
-OUT_UP_WARN_AFTER_STEP = 200
-
 # A/B gates in RecursiveBlock.  |A| > 1 for any channel makes the loop
 # potentially unstable (h_{t+1} = A*h + ... repeated num_loops times).
 GATE_A_WARN_MAX = 0.5
@@ -171,7 +167,6 @@ class DiagnosticsMonitor:
 
         # --- Weight / parameter inspections ---
         issues.extend(self._check_proj(raw_model, step))
-        issues.extend(self._check_out_up(raw_model, step))
         issues.extend(self._check_ab_gates(raw_model, config, step))
         issues.extend(self._check_kda_params(raw_model, config, step))
         issues.extend(self._check_capacity(raw_model, config, step))
@@ -228,37 +223,6 @@ class DiagnosticsMonitor:
                         f"BlockAttentionResidual proj mean |w| = {avg:.2e} — "
                         f"routing remains near-uniform. Expected >> 0 after "
                         f"step {PROJ_WARN_AFTER_STEP}."
-                    ),
-                )]
-            return []
-        self._issued.discard(key)
-        return []
-
-    def _check_out_up(self, model, step: int) -> List[_Issue]:
-        """SnapshotRetrieval out_up — should grow away from zero."""
-        vals: List[float] = []
-        for name, mod in model.named_modules():
-            # out_up is an nn.Linear with bias=False inside SnapshotRetrieval
-            if hasattr(mod, "out_up") and hasattr(mod.out_up, "weight"):
-                w = mod.out_up.weight
-                if isinstance(w, torch.Tensor) and w.numel() > 0:
-                    vals.append(w.detach().abs().float().mean().item())
-        if not vals:
-            return []
-        avg = sum(vals) / len(vals)
-        if step < OUT_UP_WARN_AFTER_STEP:
-            return []
-        key = "out_up_near_zero"
-        if avg < OUT_UP_WARN_ABS_MEAN:
-            if key not in self._issued:
-                self._issued.add(key)
-                return [_Issue(
-                    key=key, severe=False,
-                    message=(
-                        f"SnapshotRetrieval out_up mean |w| = {avg:.2e} — "
-                        f"memory branch still near-zero. Was initialised at "
-                        f"1e-3 (Logos) or 0 (hybrid). If 0-initialised, try "
-                        f"setting a small nonzero init in the model __init__."
                     ),
                 )]
             return []
@@ -749,8 +713,8 @@ def _safe_mean(vals: List[float]) -> Optional[float]:
 
 def print_model_diagnostic_summary(model: "nn.Module", config: Any) -> None:
     """Print a one-time summary of model structure and initialisation state,
-    useful for verifying that novel components (proj, out_up, A/B gates) are
-    initialised as expected."""
+    useful for verifying that novel components (proj, compressed attention,
+    A/B gates) are initialised as expected."""
 
     lines: List[str] = [_bold("[diag] Model diagnostic summary:")]
 
@@ -760,29 +724,34 @@ def print_model_diagnostic_summary(model: "nn.Module", config: Any) -> None:
 
     # Count components
     n_proj = 0
-    n_out_up = 0
     n_kda = 0
     n_moe = 0
     n_swa = 0
+    n_csa = 0
+    n_hca = 0
     has_ab = False
     for mod in model.modules():
         t = type(mod).__name__
         if hasattr(mod, "proj") and hasattr(mod, "norm"):
             n_proj += 1
-        if hasattr(mod, "out_up"):
-            n_out_up += 1
         if hasattr(mod, "A_log"):
             n_kda += 1
         if t == "MoELayer":
             n_moe += 1
         if t == "LocalAttention":
             n_swa += 1
+        if t == "CompressedGlobalAttention":
+            if getattr(mod, "mode", None) == "csa":
+                n_csa += 1
+            elif getattr(mod, "mode", None) == "hca":
+                n_hca += 1
     if hasattr(model, "body") and hasattr(model.body, "A"):
         has_ab = True
 
     lines.append(f"  BlockAttentionResidual modules: {n_proj}")
-    lines.append(f"  SnapshotRetrieval modules:      {n_out_up}")
     lines.append(f"  KDA attention layers:           {n_kda}")
+    lines.append(f"  CSA attention layers:           {n_csa}")
+    lines.append(f"  HCA attention layers:           {n_hca}")
     lines.append(f"  MoE layers:                     {n_moe}")
     lines.append(f"  SWA (local attention) layers:   {n_swa}")
     lines.append(f"  Recursive A/B gates present:    {has_ab}")
@@ -793,6 +762,12 @@ def print_model_diagnostic_summary(model: "nn.Module", config: Any) -> None:
         lines.append(f"  num_entry_layers: {getattr(config, 'num_entry_layers', '?')}")
         lines.append(f"  num_body_layers: {getattr(config, 'num_body_layers', '?')}")
         lines.append(f"  num_exit_layers: {getattr(config, 'num_exit_layers', '?')}")
+    if hasattr(model, "entry_attn_schedule"):
+        lines.append(f"  entry attention: {','.join(model.entry_attn_schedule)}")
+    if hasattr(model, "body_attn_schedule"):
+        lines.append(f"  body attention:  {','.join(model.body_attn_schedule)}")
+    if hasattr(model, "exit_attn_schedule"):
+        lines.append(f"  exit attention:  {','.join(model.exit_attn_schedule)}")
 
     # Init state of key components
     for mod in model.modules():
@@ -803,16 +778,6 @@ def print_model_diagnostic_summary(model: "nn.Module", config: Any) -> None:
                     f"  BlockAttentionResidual.proj init: "
                     f"mean={w.float().mean().item():.2e} "
                     f"max_abs={w.float().abs().max().item():.2e}"
-                )
-            break
-    for mod in model.modules():
-        if hasattr(mod, "out_up"):
-            w = mod.out_up.weight
-            if isinstance(w, torch.Tensor):
-                lines.append(
-                    f"  SnapshotRetrieval.out_up init: "
-                    f"mean={w.float().mean().item():.2e} "
-                    f"std={w.float().std().item():.2e}"
                 )
             break
     if has_ab:

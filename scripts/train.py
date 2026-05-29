@@ -33,7 +33,6 @@ from models.baseline import BaselineConfig, BaselineTransformer, count_parameter
 from models.linear import LinearConfig, LinearTransformer
 from models.recursive import RecursiveConfig, RecursiveTransformer
 from models.residual import ResidualConfig, ResidualTransformer
-from models.superlinear import SuperLinearConfig, SuperLinearTransformer
 from models.hybrid import HybridConfig, HybridTransformer
 from models.logos import LogosConfig, LogosTransformer
 from utils.tokenizer import TiktokenTokenizer
@@ -482,7 +481,6 @@ MODEL_REGISTRY: Dict[str, tuple] = {
     "linear": (LinearConfig, LinearTransformer),
     "recursive": (RecursiveConfig, RecursiveTransformer),
     "residual": (ResidualConfig, ResidualTransformer),
-    "superlinear": (SuperLinearConfig, SuperLinearTransformer),
     "hybrid": (HybridConfig, HybridTransformer),
     "logos": (LogosConfig, LogosTransformer),
 }
@@ -554,7 +552,7 @@ def split_param_groups(model):
                     base lr because input embeddings receive sparse
                     per-token gradients and benefit from larger steps.
     * ``default`` — RMSNorm scales, attention sink logits, biases (1D),
-                    plus 3D ``Conv1d`` kernels in the SuperLinear path.
+                    plus 3D ``Conv1d`` kernels in KDA attention.
                     Handled by AdamW at the standard base lr.
     * ``router``  — MoE ``Router.linear.weight`` matrices. Pulled out
                     of ``muon`` so they can run on AdamW with a smaller
@@ -861,40 +859,23 @@ def build_model(args: argparse.Namespace, vocab_size: int):
             conv_size=args.conv_size,
             chunk_size=args.chunk_size,
         )
-    elif args.model == "superlinear":
-        head_dim = args.head_dim or (args.d_model // args.num_heads)
-        kwargs.update(
-            head_dim=head_dim,
-            conv_size=args.conv_size,
-            chunk_size=args.chunk_size,
-            snapshot_interval=args.snapshot_interval,
-            snapshot_latent_dim=args.snapshot_latent_dim,
-            mem_top_k=args.mem_top_k,
-            mem_head_dim=args.mem_head_dim,
-            rope_scaling_type=args.rope_scaling_type,
-            rope_scaling_factor=args.rope_scaling_factor,
-            rope_original_max_position=args.rope_original_max_position,
-            yarn_beta_fast=args.yarn_beta_fast,
-            yarn_beta_slow=args.yarn_beta_slow,
-        )
     elif args.model == "hybrid":
         head_dim = args.head_dim or (args.d_model // args.num_heads)
         kwargs.update(
             head_dim=head_dim,
             conv_size=args.conv_size,
             chunk_size=args.chunk_size,
-            snapshot_interval=args.snapshot_interval,
-            snapshot_latent_dim=args.snapshot_latent_dim,
-            mem_top_k=args.mem_top_k,
-            mem_head_dim=args.mem_head_dim,
-            rope_scaling_type=args.rope_scaling_type,
-            rope_scaling_factor=args.rope_scaling_factor,
-            rope_original_max_position=args.rope_original_max_position,
-            yarn_beta_fast=args.yarn_beta_fast,
-            yarn_beta_slow=args.yarn_beta_slow,
             swa_window=args.swa_window,
             swa_every=args.swa_every,
             swa_offset=args.swa_offset,
+            csa_compression=args.csa_compression,
+            csa_top_k=args.csa_top_k,
+            csa_indexer_heads=args.csa_indexer_heads,
+            csa_indexer_dim=args.csa_indexer_dim,
+            hca_compression=args.hca_compression,
+            compressed_query_dim=args.compressed_query_dim,
+            compressed_head_dim=args.compressed_head_dim,
+            attn_pattern=args.attn_pattern,
         )
     elif args.model == "recursive":
         # num_layers is auto-derived from entry + body + exit.
@@ -914,18 +895,20 @@ def build_model(args: argparse.Namespace, vocab_size: int):
             head_dim=head_dim,
             conv_size=args.conv_size,
             chunk_size=args.chunk_size,
-            snapshot_interval=args.snapshot_interval,
-            snapshot_latent_dim=args.snapshot_latent_dim,
-            mem_top_k=args.mem_top_k,
-            mem_head_dim=args.mem_head_dim,
-            rope_scaling_type=args.rope_scaling_type,
-            rope_scaling_factor=args.rope_scaling_factor,
-            rope_original_max_position=args.rope_original_max_position,
-            yarn_beta_fast=args.yarn_beta_fast,
-            yarn_beta_slow=args.yarn_beta_slow,
             swa_window=args.swa_window,
             swa_every=args.swa_every,
             swa_offset=args.swa_offset,
+            csa_compression=args.csa_compression,
+            csa_top_k=args.csa_top_k,
+            csa_indexer_heads=args.csa_indexer_heads,
+            csa_indexer_dim=args.csa_indexer_dim,
+            hca_compression=args.hca_compression,
+            compressed_query_dim=args.compressed_query_dim,
+            compressed_head_dim=args.compressed_head_dim,
+            attn_pattern=args.attn_pattern,
+            entry_attn_pattern=args.entry_attn_pattern,
+            body_attn_pattern=args.body_attn_pattern,
+            exit_attn_pattern=args.exit_attn_pattern,
             num_entry_layers=args.num_entry_layers,
             num_body_layers=args.num_body_layers,
             num_exit_layers=args.num_exit_layers,
@@ -2128,8 +2111,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="[linear+] Chunk size for the KDA scan. Larger "
                              "chunks halve the Python loop trip count "
                              "(Nc = T/chunk_size) at the cost of O(C^2) "
-                             "intra-chunk activation memory. Must be a "
-                             "divisor of --snapshot-interval.")
+                             "intra-chunk activation memory.")
 
     parser.add_argument("--num-entry-layers", type=int, default=2,
                         help="[recursive,logos] Standard blocks run once before the body loop")
@@ -2179,28 +2161,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="[residual] Number of AttnRes blocks "
                              "(num_layers must be divisible by num_blocks)")
 
-    parser.add_argument("--snapshot-interval", type=int, default=256,
-                        help="[superlinear+] Token interval between KDA "
-                             "snapshots (multiple of chunk_size)")
-    parser.add_argument("--snapshot-latent-dim", type=int, default=128,
-                        help="[superlinear+] MLA-compressed latent dim per head")
-    parser.add_argument("--mem-top-k", type=int, default=16,
-                        help="[superlinear+] Top-k snapshots retrieved per token")
-    parser.add_argument("--mem-head-dim", type=int, default=64,
-                        help="[superlinear+] Per-head dim for retrieval q/k/v")
-    parser.add_argument("--rope-scaling-type", type=str, default="none",
-                        choices=["none", "ntk", "yarn"],
-                        help="[superlinear+] Retrieval RoPE scaling mode")
-    parser.add_argument("--rope-scaling-factor", type=float, default=1.0,
-                        help="[superlinear+] s = L_new / L_train. 1.0 disables.")
-    parser.add_argument("--rope-original-max-position", type=int, default=None,
-                        help="[superlinear+] Reference training context "
-                             "length for RoPE scaling (default: max_seq_len)")
-    parser.add_argument("--yarn-beta-fast", type=float, default=32.0,
-                        help="[superlinear+] YaRN: extrapolation #-rotations threshold")
-    parser.add_argument("--yarn-beta-slow", type=float, default=1.0,
-                        help="[superlinear+] YaRN: interpolation #-rotations threshold")
-
     parser.add_argument("--swa-window", type=int, default=256,
                         help="[hybrid,logos] Sliding-window size")
     parser.add_argument("--swa-every", type=int, default=4,
@@ -2208,6 +2168,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--swa-offset", type=int, default=3,
                         help="[hybrid,logos] Position of SWA within each block "
                              "of size swa_every (Samba-style end-of-block default)")
+    parser.add_argument("--csa-compression", type=int, default=4,
+                        help="[hybrid,logos] CSA token compression ratio")
+    parser.add_argument("--csa-top-k", type=int, default=1024,
+                        help="[hybrid,logos] CSA sparse recall top-k over compressed entries")
+    parser.add_argument("--csa-indexer-heads", type=int, default=4,
+                        help="[hybrid,logos] CSA first-stage indexer head count")
+    parser.add_argument("--csa-indexer-dim", type=int, default=32,
+                        help="[hybrid,logos] CSA first-stage indexer head dimension")
+    parser.add_argument("--hca-compression", type=int, default=128,
+                        help="[hybrid,logos] HCA token compression ratio")
+    parser.add_argument("--compressed-query-dim", type=int, default=None,
+                        help="[hybrid,logos] Low-rank query bottleneck for CSA/HCA. Defaults to compressed head dim.")
+    parser.add_argument("--compressed-head-dim", type=int, default=None,
+                        help="[hybrid,logos] Per-head CSA/HCA shared-KV dimension. Defaults to --head-dim.")
+    parser.add_argument("--attn-pattern", type=str, default=None,
+                        help="[hybrid,logos] Comma/semicolon pattern over kda,swa,csa,hca. "
+                             "For Logos, applies globally only when section-specific patterns are unset.")
+    parser.add_argument("--entry-attn-pattern", type=str, default=None,
+                        help="[logos] Entry attention pattern over kda,swa,csa,hca")
+    parser.add_argument("--body-attn-pattern", type=str, default=None,
+                        help="[logos] Body attention pattern expanded over num_loops*num_body_layers in loop-major order")
+    parser.add_argument("--exit-attn-pattern", type=str, default=None,
+                        help="[logos] Exit attention pattern over kda,swa,csa,hca")
 
     parser.add_argument("--tiktoken-encoding", type=str, default="cl100k_base")
 
@@ -2253,8 +2236,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--diagnostic-every", type=int, default=100,
                         help="Run training-dynamics diagnostics every N steps. "
                              "0 disables. Diagnoses body-loop gradient ratios, "
-                             "BlockAttentionResidual routing, retrieval memory "
-                             "activation, MoE load collapse, and PPL plateaus. "
+                             "BlockAttentionResidual routing, KDA parameter "
+                             "drift, MoE load collapse, and PPL plateaus. "
                              "Negligible overhead (<5ms/check).")
 
     parser.add_argument("--scheduler", type=str, default="wsd",
