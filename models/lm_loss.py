@@ -176,8 +176,12 @@ def _chunked_lce_backward(
     grad_hidden = None
     grad_hidden_flat = None
     if ctx.needs_input_grad[0]:
-        grad_hidden = torch.zeros_like(hidden)
-        grad_hidden_flat = grad_hidden.view(-1, d_model)
+        grad_hidden_contig = torch.zeros(
+            hidden.size(0), hidden.size(1), d_model,
+            device=hidden.device,
+            dtype=hidden.dtype,
+        )
+        grad_hidden_flat = grad_hidden_contig.reshape(-1, d_model)
     grad_weight = None
     if ctx.needs_input_grad[1]:
         grad_weight = torch.zeros_like(weight)
@@ -214,6 +218,10 @@ def _chunked_lce_backward(
             grad_weight = grad_weight + (
                 d_logits.t() @ h_chunk.float()
             ).to(grad_weight.dtype)
+
+        grad_hidden = grad_hidden_contig.as_strided(
+            hidden.size(), hidden.stride(), hidden.storage_offset()
+        ) if hidden.is_contiguous() else grad_hidden_contig
 
     return grad_hidden, grad_weight, None, None, None, None, None
 

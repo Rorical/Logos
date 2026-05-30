@@ -24,7 +24,7 @@ Entry and Exit run once. Body is a shared-weight stack reused `num_loops` times 
 Sublayer inputs use Block Attention Residual: a learned depth-wise softmax over completed block representations plus the current partial block. Section and loop boundaries close partial sums into the completed-block list, and a final Block Attention Residual produces the LM-head input.
 
 ```text
-block 0      : token embedding after dropout
+block 0      : token embedding
 block 1      : entry output
 blocks 2..L+1: each body loop output, L = num_loops
 final        : exit partial plus completed blocks -> final_res -> lm_head
@@ -65,6 +65,12 @@ If no explicit pattern is provided, Logos preserves the old structural KDA/SWA s
 
 Shared options across variants include Q/K RMSNorm, partial RoPE for standard attention, attention sink logits, MoE static dispatch, and optional Block Attention Residual softmax isolation for `torch.compile` stability on SMEM-constrained GPUs.
 
+### CSA and HCA Design Notes
+
+**CSA overlap.** CSA compresses tokens into fixed-size groups using two learned projections (A and B). The B projection applies a group-aligned offset so each compressed entry pools tokens from two consecutive windows (current A-group + previous B-group), providing two independent views of adjacent token blocks within a single compressed representation. This structure reduces boundary artefacts where information would otherwise be lost at group edges.
+
+**HCA causal delay.** Compressed attention entries are only visible once their token group is complete. With `hca_compression=128`, the first compressed group covers tokens 0..127 and becomes available at position 127, so positions 0..126 see no compressed attention from that group. With `csa_compression=4` (the CSA default), this delay is only 4 tokens and is negligible in practice. Other attention types (SWA, KDA) provide local and intermediate-range coverage within the same block.
+
 ## Project Structure
 
 ```text
@@ -77,9 +83,7 @@ logos/
 │   ├── hybrid.py       # KDA/SWA/CSA/HCA HybridTransformer pieces
 │   └── logos.py        # LogosTransformer
 ├── scripts/
-│   ├── train.py        # Unified causal LM training
-│   ├── train_xla.py    # TPU/XLA wrapper over train.py
-│   └── train_chat.py   # ChatML fine-tuning for baseline/linear/recursive
+│   └── train.py        # Unified causal LM training
 ├── notebooks/          # Colab wrappers and bake-off notebooks
 ├── utils/
 │   ├── diagnostics.py  # Training diagnostics
@@ -159,7 +163,7 @@ The training registry currently includes:
 ## Requirements
 
 - Python >= 3.13
-- PyTorch with CUDA support for GPU training, or matching PyTorch/XLA for TPU training
+- PyTorch with CUDA support for GPU training
 - `uv` for dependency management
 
 ## License

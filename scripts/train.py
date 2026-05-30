@@ -9,7 +9,6 @@ import argparse
 import contextlib
 import json
 import math
-import os
 import re
 import sys
 import time
@@ -18,8 +17,6 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader
 from datasets import load_dataset, DatasetDict
@@ -38,13 +35,6 @@ from models.logos import LogosConfig, LogosTransformer
 from utils.tokenizer import TiktokenTokenizer
 from utils.diagnostics import DiagnosticsMonitor, print_model_diagnostic_summary
 
-
-# ---------------------------------------------------------------------------
-# Single-host multi-GPU (DDP) helpers
-# ---------------------------------------------------------------------------
-# Activated only when launched via ``torchrun --nproc_per_node=N`` (or when
-# WORLD_SIZE > 1 in the environment). Single-GPU runs go through the same
-# code paths with rank=0, world_size=1 and behave exactly as before.
 
 def parse_token_count(value: str) -> int:
     """Parse '10B', '500M', '2.5G', '1e10', or a plain integer into a token count.
@@ -78,42 +68,8 @@ def parse_token_count(value: str) -> int:
     return int(n)
 
 
-def init_distributed() -> tuple:
-    """Read torchrun env vars, init NCCL, set the per-rank CUDA device.
-    Returns ``(rank, local_rank, world_size)``. Single-GPU returns
-    ``(0, 0, 1)`` and skips ``init_process_group``."""
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size <= 1:
-        return 0, 0, 1
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    visible = torch.cuda.device_count()
-    if local_rank >= visible:
-        raise RuntimeError(
-            f"DDP rank {rank} (local_rank={local_rank}) cannot bind to "
-            f"cuda:{local_rank}: only {visible} CUDA device(s) visible to "
-            f"this process. Re-launch with --nproc_per_node={visible} (or "
-            f"set CUDA_VISIBLE_DEVICES to expose more GPUs). "
-            f"Current CUDA_VISIBLE_DEVICES="
-            f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')!r}."
-        )
-    # Pin the device BEFORE init_process_group and pass device_id so NCCL
-    # locks the PG to this rank's GPU up front. Without this, recent
-    # torch versions warn "No device id is provided ... using GPU N as
-    # device used by this process is currently unknown."
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", device_id=device)
-    return rank, local_rank, world_size
-
-
 def is_main_process() -> bool:
-    return (
-        not dist.is_available()
-        or not dist.is_initialized()
-        or dist.get_rank() == 0
-    )
+    return True
 
 
 def configure_compile_logging(show_autotune_logs: bool) -> None:
@@ -161,33 +117,19 @@ def configure_compile_logging(show_autotune_logs: bool) -> None:
 
 
 def all_reduce_mean(t: torch.Tensor) -> torch.Tensor:
-    """Average a scalar/tensor across ranks in place. No-op single-GPU."""
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(t, op=dist.ReduceOp.AVG)
     return t
 
 
 def barrier() -> None:
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Weights & Biases (optional)
-# ---------------------------------------------------------------------------
-# Lazy import so wandb stays an optional dependency. Only the main process
-# initialises a run; non-main ranks see ``wandb_run = None`` and skip every
-# logging call. Per-step + per-eval + per-sample metrics flow through the
-# global ``wandb.log`` API, so as long as the run exists on rank 0 we can
-# call it from anywhere on rank 0 without threading state through.
-
-def init_wandb(args: argparse.Namespace, world_size: int):
+def init_wandb(args: argparse.Namespace):
     """Initialise a W&B run on the main process. Returns the run handle
-    or ``None`` if --wandb is off or we're not rank 0. Errors loudly if
+    or ``None`` if --wandb is off. Errors loudly if
     --wandb is set but the package is missing."""
     if not args.wandb:
-        return None
-    if not is_main_process():
         return None
     try:
         import wandb
@@ -206,7 +148,7 @@ def init_wandb(args: argparse.Namespace, world_size: int):
         "recursive": {"body_gate_init_std"},
         "residual":  {"num_blocks"},
     }
-    config = {**vars(args), "world_size": world_size}
+    config = vars(args).copy()
     for model_name, only_args in _MODEL_ONLY_ARGS.items():
         if args.model != model_name:
             for k in only_args:
@@ -223,10 +165,7 @@ def init_wandb(args: argparse.Namespace, world_size: int):
 
 
 def wandb_log(metrics: Dict[str, Any], step: Optional[int] = None) -> None:
-    """Rank-0 wandb.log wrapper that no-ops when wandb isn't initialised
-    (either --wandb off, non-main rank, or wandb missing)."""
-    if not is_main_process():
-        return
+    """wandb.log wrapper that no-ops when wandb is not initialised."""
     try:
         import wandb
     except ImportError:
@@ -262,9 +201,7 @@ def _moe_load_metrics(
     topk_indices: torch.Tensor, num_experts: int,
 ) -> Dict[str, Any]:
     """Per-MoE-layer load distribution. Uses ``bincount`` over the flat
-    expert-id stream (cheaper than the ``one_hot`` round-trip). Sums
-    counts across DDP ranks so the reported fractions reflect the
-    cluster-wide routing decision, not just rank-0's shard. Returns
+    expert-id stream (cheaper than the ``one_hot`` round-trip). Returns
     summary scalars (max/min/std/dead/KL-from-uniform) and the raw
     fraction tensor on CPU for ``wandb.Histogram``.
 
@@ -275,8 +212,6 @@ def _moe_load_metrics(
     counts = torch.bincount(
         topk_indices.reshape(-1), minlength=num_experts,
     ).float()
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
     total = counts.sum().clamp(min=1.0)
     frac = counts / total
     target = 1.0 / num_experts
@@ -305,10 +240,8 @@ def log_moe_load(
     topk_indices_list,
     step: int,
 ) -> None:
-    """Compute and wandb-log per-MoE-layer load distribution. All DDP ranks
-    must participate because ``_moe_load_metrics`` performs all-reduces;
-    only rank 0 constructs W&B objects and logs the final metrics. No-op
-    when W&B logging is disabled or the model has no MoE in this forward
+    """Compute and wandb-log per-MoE-layer load distribution. No-op when
+    W&B logging is disabled or the model has no MoE in this forward
     (``topk_indices_list`` is None / all-None).
 
     Cost: one bincount + one all_reduce per layer (~22 layers in the
@@ -326,8 +259,6 @@ def log_moe_load(
         if topk is None:
             continue
         m = _moe_load_metrics(topk, num_experts)
-        if not is_main_process():
-            continue
         prefix = f"moe/{name}"
         metrics[f"{prefix}/load_max"] = m["load_max"]
         metrics[f"{prefix}/load_min"] = m["load_min"]
@@ -338,7 +269,7 @@ def log_moe_load(
         metrics[f"{prefix}/load_hist"] = wandb.Histogram(
             sequence=m["frac"].tolist(), num_bins=num_experts,
         )
-    if is_main_process() and metrics:
+    if metrics:
         import wandb
         if wandb.run is None:
             return
@@ -837,7 +768,6 @@ def build_model(args: argparse.Namespace, vocab_size: int):
         num_heads=args.num_heads,
         d_ff=args.d_ff,
         max_seq_len=args.max_length,
-        dropout=args.dropout,
         norm_eps=args.norm_eps,
         use_moe=args.use_moe,
         num_shared_experts=args.num_shared_experts,
@@ -976,18 +906,10 @@ def create_dataloader(
     shuffle: bool = True,
     num_workers: int = 0,
     prefetch_factor: int = 4,
-    rank: int = 0,
-    world_size: int = 1,
     seed: int = 0,
     drop_last: bool = False,
 ) -> DataLoader:
-    """Wrap a finite tokenised HF dataset in a PyTorch DataLoader.
-
-    Under DDP (``world_size > 1``) attaches a ``DistributedSampler`` so
-    each rank sees a disjoint slice of the dataset every epoch. The
-    sampler's ``set_epoch`` is driven from ``run_epoch`` to advance the
-    shuffle seed each epoch.
-    """
+    """Wrap a finite tokenised HF dataset in a PyTorch DataLoader."""
 
     class _Dataset(torch.utils.data.Dataset):
         def __init__(self, hf_dataset):
@@ -1018,25 +940,9 @@ def create_dataloader(
         }
 
     ds = _Dataset(dataset)
-    sampler: Optional[torch.utils.data.distributed.DistributedSampler] = None
-    if world_size > 1:
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            ds,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=shuffle,
-            seed=seed,
-            drop_last=drop_last,
-        )
-        # DataLoader.shuffle must be False when a sampler is supplied.
-        loader_shuffle = False
-    else:
-        loader_shuffle = shuffle
-
     loader_kwargs: Dict[str, Any] = dict(
         batch_size=batch_size,
-        shuffle=loader_shuffle,
-        sampler=sampler,
+        shuffle=shuffle,
         collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
@@ -1067,12 +973,6 @@ def run_epoch(
     log_every: int = 10,
 ) -> Dict[str, float]:
     model.train(is_train)
-
-    # DistributedSampler needs ``set_epoch`` each epoch so its shuffle
-    # seed advances; without it every epoch sees the same per-rank order.
-    sampler = getattr(dataloader, "sampler", None)
-    if isinstance(sampler, torch.utils.data.distributed.DistributedSampler):
-        sampler.set_epoch(epoch)
 
     main = is_main_process()
 
@@ -1161,22 +1061,7 @@ def run_epoch(
 
     pbar.close()
 
-    # Reduce sums across ranks so every rank reports the same global
-    # average (matches ``evaluate()`` in the streaming path). For train
-    # this is cosmetic — the optimizer step already syncs gradients via
-    # DDP — but for val it's the difference between a per-rank shard
-    # metric and the cluster-wide one. This is the only host sync for
-    # the accumulated loss in the entire epoch.
-    if dist.is_available() and dist.is_initialized():
-        agg = torch.stack([
-            total_loss_t,
-            torch.tensor(float(num_batches), dtype=torch.float64, device=total_loss_t.device),
-        ])
-        dist.all_reduce(agg, op=dist.ReduceOp.SUM)
-        total_loss = agg[0].item()
-        num_batches = int(agg[1].item())
-    else:
-        total_loss = total_loss_t.item()
+    total_loss = total_loss_t.item()
 
     if num_batches == 0:
         return {"loss": float("inf"), "ppl": float("inf")}
@@ -1371,9 +1256,7 @@ class PackedStream(torch.utils.data.IterableDataset):
 
     def __iter__(self):
         # Shard across DataLoader workers so ``num_workers > 0`` doesn't
-        # have every worker re-emit the same documents. Per-rank sharding
-        # is already handled upstream by ``split_dataset_by_node``; this
-        # adds the intra-rank stride.
+        # have every worker re-emit the same documents.
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
             stride, offset = 1, 0
@@ -1426,9 +1309,7 @@ _LOCAL_DATASET_FORMATS: Dict[str, str] = {
 def _resolve_local_data_files(path: Path) -> tuple:
     """Map a local file or directory to ``(builder_name, sorted files)``.
 
-    Sorted output keeps every DDP rank's file ordering identical so
-    ``split_dataset_by_node`` (streaming) and ``DistributedSampler``
-    (finite) produce the same shard split across runs and ranks.
+    Sorted output keeps local file iteration deterministic across runs.
     """
     if path.is_file():
         fmt = _LOCAL_DATASET_FORMATS.get(path.suffix.lower())
@@ -1487,8 +1368,6 @@ def _describe_dataset_source(
 def build_streaming_loaders(
     args: argparse.Namespace,
     tokenizer,
-    rank: int = 0,
-    world_size: int = 1,
 ):
     """Build (train, val) loaders for a streaming dataset source.
 
@@ -1500,13 +1379,7 @@ def build_streaming_loaders(
 
     Caches the first ``--val-docs`` documents into memory for validation
     and uses ``.skip(val_docs)`` on the training stream so the slices
-    don't overlap. ``num_workers=0`` because IterableDataset across
-    multiple workers needs explicit shard partitioning.
-
-    Under DDP each rank gets a disjoint slice of the same stream via
-    ``datasets.distributed.split_dataset_by_node``, so per-step batches
-    don't overlap across ranks. The cached val docs are striped by
-    ``rank::world_size``.
+    don't overlap.
     """
     if not args.dataset:
         raise ValueError(
@@ -1526,15 +1399,7 @@ def build_streaming_loaders(
         print(f"  cached {len(val_docs_full)} docs for val")
     train_stream = load_dataset(**load_kwargs).skip(args.val_docs)
 
-    if world_size > 1:
-        from datasets.distributed import split_dataset_by_node
-        train_stream = split_dataset_by_node(train_stream, rank, world_size)
-        val_docs = val_docs_full[rank::world_size]
-        if is_main_process():
-            print(f"  DDP shard: rank {rank}/{world_size}, "
-                  f"val docs per rank ~ {len(val_docs)}")
-    else:
-        val_docs = val_docs_full
+    val_docs = val_docs_full
 
     train_ds = PackedStream(train_stream, tokenizer, args.max_length,
                             text_key=args.text_column)
@@ -1577,8 +1442,7 @@ def evaluate(
     use_amp: bool, mp_dtype: torch.dtype, max_batches: Optional[int] = None,
 ) -> Dict[str, float]:
     """Single pass over ``dataloader``; returns ``{loss, ppl, n_skipped}``.
-    Under DDP every rank evaluates its shard and we all-reduce a per-batch
-    running sum so ranks agree on the reported metric. Batches whose loss
+    Batches whose loss
     is NaN/Inf are skipped (and counted) instead of poisoning the running
     sum — observed when the val path falls back to eager flex_attention
     after the compiled-cache busts during sampling, where bf16 score_mod
@@ -1602,10 +1466,6 @@ def evaluate(
         count += finite.to(torch.float64)
         skipped += (~finite).to(torch.float64)
     model.train(was_training)
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(skipped, op=dist.ReduceOp.SUM)
     n = count.item()
     n_skipped = int(skipped.item())
     if n == 0:
@@ -1659,18 +1519,10 @@ def run_step_training(
     grad_clip = args.grad_clip
     log_every = max(1, args.log_every)
     main = is_main_process()
-    world_size = (
-        dist.get_world_size()
-        if dist.is_available() and dist.is_initialized()
-        else 1
-    )
-
     if main:
         print("\n" + "=" * 60)
         resume_note = f" | resuming at step {start_step}" if start_step else ""
-        print(f"Streaming training: {total_steps} steps"
-              + (f" | DDP world_size={world_size}" if world_size > 1 else "")
-              + resume_note)
+        print(f"Streaming training: {total_steps} steps" + resume_note)
         print("=" * 60)
 
     history: list = []
@@ -1753,9 +1605,7 @@ def run_step_training(
                 muon_hp.step()
 
             # Router-bias and EMA updates always go through the unwrapped
-            # raw model so DDP/compile attribute forwarding can't desync
-            # the bias buffer or break AveragedModel's parameter-id
-            # snapshot.
+            # raw model so torch.compile wrappers do not affect state updates.
             if topk_indices is not None:
                 raw_model.update_router_biases(topk_indices)
             if ema_model is not None:
@@ -1782,14 +1632,10 @@ def run_step_training(
             log_moe_load(args, topk_indices, step + 1)
 
         step += 1
-        # All-reduce the per-rank loss for display so every rank logs the
-        # same global average. Detach so the backward graph is untouched;
-        # stack with optional grad_norm to pull everything to CPU in a
-        # single sync instead of multiple .item() stalls.
+        # Detach so the backward graph is untouched; stack with optional
+        # grad_norm to pull everything to CPU in a single sync instead of
+        # multiple .item() stalls.
         loss_d = loss.detach().reshape(1)
-        if world_size > 1:
-            loss_d = loss_d.clone()
-            all_reduce_mean(loss_d)
         if grad_norm is not None:
             # Single device->host sync for loss + global grad norm + per-
             # group grad norms. Keeps rank-0 wandb logging cheap even
@@ -1814,13 +1660,12 @@ def run_step_training(
             running_count += 1
         pbar.update(1)
 
-        # Per-step W&B log (rank-0 only via wandb_log). Includes the raw
-        # per-step loss, current LR for every param group (Muon /
+        # Per-step W&B log. Includes the raw per-step loss, current LR for every param group (Muon /
         # AdamW-default / AdamW-embed), Muon-specific momentum + WD when
         # the muon_hp ramp is active, grad norm, and the running token
         # count so plots can be x-axis'd by tokens instead of steps.
         if main:
-            tokens_seen = step * args.batch_size * args.max_length * world_size
+            tokens_seen = step * args.batch_size * args.max_length
             metrics = {
                 "train/loss": loss_val,
                 "train/ppl": math.exp(min(loss_val, 20)),
@@ -1848,19 +1693,15 @@ def run_step_training(
                 ppl = float("nan")
             running_avg = avg  # save for diagnostics
             elapsed = time.time() - t0
-            # Cluster-wide tokens/sec for the *current* run — counts only
-            # post-resume steps so an old checkpoint doesn't inflate the
-            # rate against the just-now-elapsed wall time. Multiplies
-            # per-rank tokens by world_size so the headline reflects
-            # total throughput.
+            # Tokens/sec for the current run, counting only post-resume steps.
             steps_this_run = step - start_step
-            tps = (steps_this_run * args.batch_size * args.max_length * world_size) / max(elapsed, 1)
+            tps = (steps_this_run * args.batch_size * args.max_length) / max(elapsed, 1)
             postfix = {
                 "loss": f"{avg:.3f}", "ppl": f"{ppl:.1f}",
                 "lr": f"{optimizer.param_groups[0]['lr']:.1e}",
                 "tok/s": f"{tps:.0f}",
             }
-            # Approximate per-rank max expert-load fraction across all MoE
+            # Approximate max expert-load fraction across all MoE
             # layers; cheap enough to update on every tqdm refresh and
             # gives early warning of router collapse without waiting for
             # the throttled --moe-log-every wandb dump. Also emits
@@ -1929,10 +1770,9 @@ def run_step_training(
         )
 
         if eval_due:
-            # Eval runs on the uncompiled raw_model on every rank — sidesteps
+            # Eval runs on the uncompiled raw_model, sidestepping
             # any compile-time recompile from a different shape and keeps the
-            # graph identical to training. all-reduce inside ``evaluate``
-            # synchronises the metric across ranks before logging.
+            # graph identical to training.
             val_metrics = evaluate(raw_model, val_loader, device, use_amp, mp_dtype)
             ema_val_metrics = None
             if ema_model is not None:
@@ -2042,7 +1882,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Sequence block size")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4,
-                        help="DataLoader worker processes per rank. Use 0 to "
+                        help="DataLoader worker processes. Use 0 to "
                              "load in the main process (debug only); 4–8 is a "
                              "good default for tokenized streams.")
     parser.add_argument("--prefetch-factor", type=int, default=4,
@@ -2057,7 +1897,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--d-ff", type=int, default=1364,
                         help="Dense SwiGLU intermediate dim")
-    parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--norm-eps", type=float, default=1e-6)
     parser.add_argument("--use-moe", action="store_true")
     parser.add_argument("--num-shared-experts", type=int, default=2)
@@ -2317,30 +2156,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "emit thousands of stderr lines on large models.")
     parser.add_argument("--bf16", action="store_true",
                         help="Enable bfloat16 mixed precision (Ampere+)")
-    parser.add_argument("--ddp-find-unused-parameters", action="store_true",
-                        help="DDP only: pass find_unused_parameters=True. "
-                             "Default False (faster). Enable if a forward "
-                             "skips a parameter that has requires_grad=True; "
-                             "with Logos top-k=4 over 32 experts at "
-                             "bs*seq>=2k tokens per rank, every expert is "
-                             "selected each step so this is not needed.")
-    parser.add_argument("--ddp-static-graph", action=argparse.BooleanOptionalAction,
-                        default=False,
-                        help="DDP only: enable static_graph=True so the bucket "
-                             "plan is fused after the first iteration. Requires "
-                             "every parameter to participate in every step; "
-                             "auto-disabled when --ddp-find-unused-parameters "
-                             "is set. Default off because DDP's fused compile "
-                             "path can fail on graphs with dynamic-shape "
-                             "submod boundaries with ``AttributeError: 'int' "
-                             "object has no attribute 'meta'``; enable "
-                             "explicitly when validated.")
-
     parser.add_argument("--wandb", action="store_true",
                         help="Log per-step + per-eval metrics to Weights & "
-                             "Biases. Rank-0 only under DDP. Requires "
-                             "`pip install -e .[wandb]` (or `pip install "
-                             "wandb`) and a logged-in WANDB_API_KEY.")
+                             "Biases. Requires `pip install -e .[wandb]` "
+                             "(or `pip install wandb`) and a logged-in "
+                             "WANDB_API_KEY.")
     parser.add_argument("--wandb-project", type=str, default="logos-pretrain")
     parser.add_argument("--wandb-entity", type=str, default=None,
                         help="W&B team/user; falls back to default entity.")
@@ -2356,7 +2176,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Log MoE per-expert load fraction histogram + "
                              "summary scalars (max/min/std/dead/KL-from-uniform) "
                              "to W&B every N steps. 0 disables. Cheap enough "
-                             "(~one bincount + all_reduce per MoE layer) to "
+                             "(~one bincount per MoE layer) to "
                              "leave on for the full run; useful for catching "
                              "router collapse early.")
     parser.add_argument("--opt-state-log-every", type=int, default=1000,
@@ -2394,9 +2214,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Alternative to --total-steps: token budget for "
                              "the run. Accepts 10B / 500M / 2.5G / 1e10 / a "
                              "plain integer. Derives total_steps from "
-                             "world_size * batch_size * max_length so a "
-                             "fixed token budget stays fixed when you sweep "
-                             "batch size or DDP world size. Mutually "
+                             "batch_size * max_length so a fixed token budget "
+                             "stays fixed when you sweep batch size. Mutually "
                              "exclusive with --total-steps.")
     parser.add_argument("--val-docs", type=int, default=200,
                         help="With --streaming: how many of the first docs "
@@ -2413,22 +2232,18 @@ def main(args: Optional[argparse.Namespace] = None):
     if args is None:
         args = build_arg_parser().parse_args()
 
-    rank, local_rank, world_size = init_distributed()
     main_proc = is_main_process()
 
-    # Each rank gets a different RNG offset so streaming-dataset shuffling /
-    # dropout / sample-time noise don't lock-step across ranks.
-    torch.manual_seed(args.seed + rank)
+    torch.manual_seed(args.seed)
 
     if args.device:
         device = torch.device(args.device)
     elif torch.cuda.is_available():
-        device = torch.device(f"cuda:{local_rank}" if world_size > 1 else "cuda")
+        device = torch.device("cuda")
     else:
         device = torch.device("cpu")
     if main_proc:
-        print(f"Using device: {device} | model: {args.model}"
-              + (f" | DDP world_size={world_size}" if world_size > 1 else ""))
+        print(f"Using device: {device} | model: {args.model}")
 
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
@@ -2446,7 +2261,7 @@ def main(args: Optional[argparse.Namespace] = None):
         save_dir.mkdir(parents=True, exist_ok=True)
     barrier()
 
-    wandb_run = init_wandb(args, world_size)
+    wandb_run = init_wandb(args)
     if wandb_run is not None:
         print(f"  W&B run: {wandb_run.url}")
 
@@ -2461,10 +2276,10 @@ def main(args: Optional[argparse.Namespace] = None):
             raise ValueError(
                 "--total-steps and --total-tokens are mutually exclusive; "
                 "pick one. --total-tokens derives total_steps from "
-                "world_size * batch_size * max_length."
+                "batch_size * max_length."
             )
         if args.total_tokens is not None:
-            tokens_per_step = world_size * args.batch_size * args.max_length
+            tokens_per_step = args.batch_size * args.max_length
             args.total_steps = max(1, math.ceil(args.total_tokens / tokens_per_step))
             if main_proc:
                 actual_tokens = args.total_steps * tokens_per_step
@@ -2481,24 +2296,13 @@ def main(args: Optional[argparse.Namespace] = None):
                 "--total-tokens (e.g. 10B); the schedule horizon and "
                 "loop termination both depend on it."
             )
-        if world_size > 1 and main_proc:
-            print(f"  DDP token budget: per-step tokens = "
-                  f"{world_size} x {args.batch_size} x {args.max_length} = "
-                  f"{world_size * args.batch_size * args.max_length:,}. "
-                  f"--total-tokens accounts for world_size automatically; "
-                  f"if you set --total-steps manually, divide by "
-                  f"{world_size} to keep the token budget fixed vs "
-                  f"single-GPU.")
         train_loader, val_loader = build_streaming_loaders(
-            args, tokenizer, rank=rank, world_size=world_size,
+            args, tokenizer,
         )
     else:
         # ``--dataset`` may be a Hub name, a local file (.json/.csv/.txt),
         # or a local directory holding a saved-to-disk HF dataset
-        # (e.g. a partial snapshot of fineweb-edu sample-10BT). Loading
-        # is run on rank-0 first so the HF cache is warm before the
-        # other ranks try to populate it; non-main ranks then read the
-        # same fingerprinted files instead of racing on .map().
+        # (e.g. a partial snapshot of fineweb-edu sample-10BT).
         def _load_and_preprocess():
             if main_proc:
                 print(f"Loading dataset: "
@@ -2537,33 +2341,23 @@ def main(args: Optional[argparse.Namespace] = None):
             )
             return ds
 
-        if main_proc:
-            dataset = _load_and_preprocess()
-        barrier()
-        if not main_proc:
-            dataset = _load_and_preprocess()
-        barrier()
+        dataset = _load_and_preprocess()
 
         if main_proc:
             print(f"  train examples:      {len(dataset['train'])}")
             print(f"  validation examples: {len(dataset['validation'])}")
 
-        # Under DDP, attach DistributedSampler so each rank consumes a
-        # disjoint shard each epoch. Val drops the trailing partial
-        # batch when sharded so per-rank counts match exactly and the
-        # all-reduce in ``run_epoch`` averages cleanly.
         train_loader = create_dataloader(
             dataset["train"], args.batch_size, shuffle=True,
             num_workers=args.num_workers,
             prefetch_factor=args.prefetch_factor,
-            rank=rank, world_size=world_size, seed=args.seed,
+            seed=args.seed,
         )
         val_loader = create_dataloader(
             dataset["validation"], args.batch_size, shuffle=False,
             num_workers=args.num_workers,
             prefetch_factor=args.prefetch_factor,
-            rank=rank, world_size=world_size, seed=args.seed,
-            drop_last=(world_size > 1),
+            seed=args.seed,
         )
 
     config, model = build_model(args, vocab_size=tokenizer.vocab_size)
@@ -2595,7 +2389,7 @@ def main(args: Optional[argparse.Namespace] = None):
     router_warmup = (
         args.router_warmup_steps
         if args.router_warmup_steps is not None
-        else 3 * args.warmup_steps
+        else max(1, args.warmup_steps)
     )
     if main_proc:
         if args.muon and n_muon > 0:
@@ -2701,29 +2495,8 @@ def main(args: Optional[argparse.Namespace] = None):
             )
         return tokenizer.decode(generated[0])
 
-    # DDP wrap goes BEFORE torch.compile so the compiled graph captures
-    # DDP's gradient-bucket hooks. ``raw_model`` keeps a handle to the
-    # underlying nn.Module for state_dict / EMA / sample / router-bias.
-    if world_size > 1:
-        # static_graph fuses the gradient-bucket plan after the first
-        # iteration; requires every parameter to participate every step.
-        # Mutually exclusive with find_unused_parameters=True.
-        ddp_static_graph = (
-            args.ddp_static_graph and not args.ddp_find_unused_parameters
-        )
-        if main_proc:
-            print(f"  Wrapping model in DDP "
-                  f"(find_unused_parameters={args.ddp_find_unused_parameters}, "
-                  f"gradient_as_bucket_view=True, "
-                  f"static_graph={ddp_static_graph})")
-        model = DDP(
-            model,
-            device_ids=[local_rank] if device.type == "cuda" else None,
-            output_device=local_rank if device.type == "cuda" else None,
-            find_unused_parameters=args.ddp_find_unused_parameters,
-            gradient_as_bucket_view=True,
-            static_graph=ddp_static_graph,
-        )
+    # ``raw_model`` keeps a handle to the underlying nn.Module for
+    # state_dict / EMA / sample / router-bias.
 
     if args.compile:
         configure_compile_logging(args.compile_autotune_logs)
@@ -2796,15 +2569,11 @@ def main(args: Optional[argparse.Namespace] = None):
             print("Training complete!")
         if wandb_run is not None:
             wandb_run.finish()
-        barrier()
-        if dist.is_available() and dist.is_initialized():
-            dist.destroy_process_group()
         return
 
     if main_proc:
         print("\n" + "=" * 60)
-        print("Starting training"
-              + (f" | DDP world_size={world_size}" if world_size > 1 else ""))
+        print("Starting training")
         print("=" * 60)
 
     best_val_loss = float("inf")
@@ -2974,9 +2743,6 @@ def main(args: Optional[argparse.Namespace] = None):
         print("Training complete!")
     if wandb_run is not None:
         wandb_run.finish()
-    barrier()
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

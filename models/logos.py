@@ -43,17 +43,6 @@ from models.lm_loss import (
 )
 
 
-def _xla_checkpoint(function, *args):
-    try:
-        from torch_xla.utils.checkpoint import checkpoint as xla_checkpoint
-    except ImportError as exc:
-        raise ImportError(
-            "XLA gradient checkpointing requires torch_xla.utils.checkpoint. "
-            "Install a torch_xla build matching your PyTorch version."
-        ) from exc
-    return xla_checkpoint(function, *args, use_reentrant=True)
-
-
 def _legacy_kind(layer_idx: int, config: "LogosConfig") -> str:
     return "swa" if (layer_idx % config.swa_every) == config.swa_offset else "kda"
 
@@ -199,7 +188,7 @@ class LogosTransformerBlock(nn.Module):
         if config.use_moe:
             self.ffn = MoELayer(config, num_loops=num_loops, top_k=top_k)
         else:
-            self.ffn = SwiGLU(config.d_model, config.d_ff, config.dropout)
+            self.ffn = SwiGLU(config.d_model, config.d_ff)
         self.ffn_res = BlockAttentionResidual(
             config.d_model, eps=config.norm_eps,
             isolate_softmax=isolate_res,
@@ -249,7 +238,6 @@ class LogosTransformer(nn.Module):
         )
 
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.dropout = nn.Dropout(config.dropout)
 
         self.entry = nn.ModuleList([
             LogosTransformerBlock(
@@ -337,7 +325,6 @@ class LogosTransformer(nn.Module):
         is_causal: bool = True,
     ) -> Dict[str, Any]:
         x = self.token_emb(input_ids)
-        x = self.dropout(x)
 
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []
@@ -346,12 +333,11 @@ class LogosTransformer(nn.Module):
         partial: Optional[torch.Tensor] = None
 
         use_ckpt = self.config.gradient_checkpointing and self.training
-        use_xla_ckpt = use_ckpt and input_ids.device.type == "xla"
         per_loop_ckpt = (
-            use_ckpt and not use_xla_ckpt
+            use_ckpt
             and getattr(self.config, "ckpt_granularity", "per-block") == "per-loop"
         )
-        per_block_ckpt = use_ckpt and not use_xla_ckpt and not per_loop_ckpt
+        per_block_ckpt = use_ckpt and not per_loop_ckpt
 
         def _call_block(block_module, blocks_in, partial_in, attention_kind, loop_idx):
             return block_module(
@@ -368,19 +354,6 @@ class LogosTransformer(nn.Module):
                 use_reentrant=False,
             )
 
-        def _xla_ckpt_block(block_module, blocks_in, partial_in, attention_kind, loop_idx):
-            def _fn(*flat_inputs):
-                blocks_flat = list(flat_inputs[:-1])
-                partial_flat = flat_inputs[-1]
-                return block_module(
-                    blocks_flat, partial_flat, attention_kind,
-                    attention_mask=attention_mask, is_causal=is_causal,
-                    cache=None, loop_idx=loop_idx,
-                )
-            if partial_in is None:
-                return _fn(*blocks_in, None)
-            return _xla_checkpoint(_fn, *blocks_in, partial_in)
-
         for idx, layer in enumerate(self.entry):
             partial, layer_aux, layer_topk = _call_block(
                 layer, blocks, partial, self.entry_attn_schedule[idx], 0,
@@ -396,15 +369,15 @@ class LogosTransformer(nn.Module):
             if per_loop_ckpt:
                 _li = loop_idx
 
-                def _body_loop(blks, p):
+                def _body_loop(blks, p, loop_i=_li):
                     aux_sum = torch.zeros((), device=blks[0].device, dtype=blks[0].dtype)
                     topks: List[Optional[torch.Tensor]] = []
                     for r, block in enumerate(self.body):
-                        kind = self.body_attn_schedule[_li * self.config.num_body_layers + r]
+                        kind = self.body_attn_schedule[loop_i * self.config.num_body_layers + r]
                         p, la, lt = block(
                             blks, p, kind,
                             attention_mask=attention_mask, is_causal=is_causal,
-                            cache=None, loop_idx=_li,
+                            cache=None, loop_idx=loop_i,
                         )
                         aux_sum = aux_sum + la
                         topks.append(lt)
@@ -418,8 +391,6 @@ class LogosTransformer(nn.Module):
             else:
                 if per_block_ckpt:
                     runner = _ckpt_block
-                elif use_xla_ckpt:
-                    runner = _xla_ckpt_block
                 else:
                     runner = _call_block
                 for r, block in enumerate(self.body):

@@ -413,7 +413,6 @@ class CompressedGlobalAttention(nn.Module):
             self.indexer_dim = config.csa_indexer_dim
 
         self.out_proj = nn.Linear(config.num_heads * self.head_dim, config.d_model, bias=False)
-        self.dropout = config.dropout
         self.attention_sink = config.attention_sink
         if self.attention_sink:
             self.sink_logit = nn.Parameter(torch.zeros(config.num_heads))
@@ -479,8 +478,6 @@ class CompressedGlobalAttention(nn.Module):
             safe_scores = torch.where(all_masked, torch.zeros_like(scores), scores)
             weights = F.softmax(safe_scores.float(), dim=-1).to(kv.dtype)
             weights = torch.where(all_masked, torch.zeros_like(weights), weights)
-        if self.training and self.dropout > 0:
-            weights = F.dropout(weights, p=self.dropout)
         out = torch.einsum("bhtn,bnd->bhtd", weights, kv)
         if attention_mask is not None:
             out = out * attention_mask.view(B, 1, T, 1).to(out.dtype)
@@ -530,7 +527,7 @@ class HybridTransformerBlock(nn.Module):
         if config.use_moe:
             self.ffn = MoELayer(config)
         else:
-            self.ffn = SwiGLU(config.d_model, config.d_ff, config.dropout)
+            self.ffn = SwiGLU(config.d_model, config.d_ff)
 
     def forward(
         self,
@@ -564,7 +561,6 @@ class HybridTransformer(nn.Module):
         self.config = config
 
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.dropout = nn.Dropout(config.dropout)
 
         if config.attn_pattern:
             self.attn_schedule = expand_attention_pattern(
@@ -604,7 +600,6 @@ class HybridTransformer(nn.Module):
         caches: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         x = self.token_emb(input_ids)
-        x = self.dropout(x)
 
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []

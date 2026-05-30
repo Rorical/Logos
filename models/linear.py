@@ -438,7 +438,7 @@ class LinearTransformerBlock(nn.Module):
         if config.use_moe:
             self.ffn = MoELayer(config)
         else:
-            self.ffn = SwiGLU(config.d_model, config.d_ff, config.dropout)
+            self.ffn = SwiGLU(config.d_model, config.d_ff)
 
     def forward(
         self,
@@ -464,7 +464,6 @@ class LinearTransformer(nn.Module):
         self.config = config
 
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.dropout = nn.Dropout(config.dropout)
 
         self.layers = nn.ModuleList([
             LinearTransformerBlock(config) for _ in range(config.num_layers)
@@ -494,7 +493,6 @@ class LinearTransformer(nn.Module):
         caches: Optional[List[Dict[str, Optional[torch.Tensor]]]] = None,
     ) -> Dict[str, Any]:
         x = self.token_emb(input_ids)
-        x = self.dropout(x)
 
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []

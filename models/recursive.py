@@ -110,7 +110,6 @@ class RecursiveTransformer(nn.Module):
         self.config = config
 
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.dropout = nn.Dropout(config.dropout)
 
         self.entry = nn.ModuleList([
             TransformerBlock(config) for _ in range(config.num_entry_layers)
@@ -145,7 +144,6 @@ class RecursiveTransformer(nn.Module):
         is_causal: bool = True,
     ) -> Dict[str, Any]:
         x = self.token_emb(input_ids)
-        x = self.dropout(x)
 
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []

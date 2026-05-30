@@ -8,14 +8,10 @@ from typing import List, Optional, Tuple, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 
 def _maybe_all_reduce_load(load: torch.Tensor) -> torch.Tensor:
-    """Sum a per-expert load tensor across DDP ranks in place. No-op when
-    distributed is not initialised so single-GPU training is unchanged."""
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(load, op=dist.ReduceOp.SUM)
+    """Single-process hook kept to centralize expert-load accounting."""
     return load
 
 
@@ -56,7 +52,6 @@ class BaselineConfig:
 
     num_layers: int = 12
     num_heads: int = 8
-    dropout: float = 0.0
     norm_eps: float = 1e-6
 
     # SwiGLU has 3 matmuls; ~(8/3) * d_model matches a 4*d_model 2-matmul FFN.
@@ -151,21 +146,20 @@ class RotaryEmbedding(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, d_ff: int):
         super().__init__()
         self.w_gate = nn.Linear(d_model, d_ff, bias=False)
         self.w_up = nn.Linear(d_model, d_ff, bias=False)
         self.w_down = nn.Linear(d_ff, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
+        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
 
 
 class Expert(nn.Module):
-    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, d_ff: int):
         super().__init__()
-        self.ffn = SwiGLU(d_model, d_ff, dropout)
+        self.ffn = SwiGLU(d_model, d_ff)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.ffn(x)
@@ -184,7 +178,6 @@ class SparseExpertBank(nn.Module):
         num_experts: int,
         d_model: int,
         d_ff: int,
-        dropout: float = 0.0,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -193,7 +186,6 @@ class SparseExpertBank(nn.Module):
         self.w_gate = nn.Parameter(torch.empty(num_experts * d_ff, d_model))
         self.w_up = nn.Parameter(torch.empty(num_experts * d_ff, d_model))
         self.w_down = nn.Parameter(torch.empty(num_experts * d_model, d_ff))
-        self.dropout = nn.Dropout(dropout)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -221,7 +213,7 @@ class SparseExpertBank(nn.Module):
         h_gate = torch.bmm(expert_in, w_gate.transpose(-1, -2))
         h_up = torch.bmm(expert_in, w_up.transpose(-1, -2))
         hidden = F.silu(h_gate) * h_up
-        return self.dropout(torch.bmm(hidden, w_down.transpose(-1, -2)))
+        return torch.bmm(hidden, w_down.transpose(-1, -2))
 
 
 class Router(nn.Module):
@@ -276,14 +268,13 @@ class MoELayer(nn.Module):
         )
 
         self.shared_experts = nn.ModuleList([
-            Expert(config.d_model, config.expert_d_ff, config.dropout)
+            Expert(config.d_model, config.expert_d_ff)
             for _ in range(config.num_shared_experts)
         ])
         self.sparse_experts = SparseExpertBank(
             config.num_sparse_experts,
             config.d_model,
             config.expert_d_ff,
-            config.dropout,
         )
 
     def forward(
@@ -469,8 +460,6 @@ def manual_attention(
     v: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
     sink_logit: Optional[torch.Tensor] = None,
-    dropout_p: float = 0.0,
-    training: bool = False,
 ) -> torch.Tensor:
     D = q.shape[-1]
     scale = D ** -0.5
@@ -481,8 +470,6 @@ def manual_attention(
         weights = softmax_with_sink(scores, sink_logit)
     else:
         weights = F.softmax(scores, dim=-1)
-    if training and dropout_p > 0.0:
-        weights = F.dropout(weights, p=dropout_p)
     return weights @ v
 
 
@@ -495,7 +482,6 @@ class Attention(nn.Module):
         self.d_model = config.d_model
         self.num_heads = config.num_heads
         self.head_dim = config.d_model // config.num_heads
-        self.dropout = config.dropout
 
         self.q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.k_proj = nn.Linear(config.d_model, config.d_model, bias=False)
@@ -578,14 +564,11 @@ class Attention(nn.Module):
                 q, k, v,
                 mask=mask,
                 sink_logit=self.sink_logit,
-                dropout_p=self.dropout,
-                training=self.training,
             )
         else:
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=mask,
-                dropout_p=self.dropout if self.training else 0.0,
                 is_causal=(mask is None and is_causal),
             )
 
@@ -611,7 +594,7 @@ class TransformerBlock(nn.Module):
         if config.use_moe:
             self.ffn = MoELayer(config, num_loops=num_loops)
         else:
-            self.ffn = SwiGLU(config.d_model, config.d_ff, config.dropout)
+            self.ffn = SwiGLU(config.d_model, config.d_ff)
 
     def forward(
         self,
@@ -637,7 +620,6 @@ class BaselineTransformer(nn.Module):
         self.config = config
 
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.dropout = nn.Dropout(config.dropout)
 
         self.layers = nn.ModuleList([
             TransformerBlock(config) for _ in range(config.num_layers)
@@ -666,7 +648,6 @@ class BaselineTransformer(nn.Module):
         is_causal: bool = True,
     ) -> Dict[str, Any]:
         x = self.token_emb(input_ids)
-        x = self.dropout(x)
 
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []

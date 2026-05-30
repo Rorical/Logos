@@ -176,7 +176,7 @@ class ResidualTransformerBlock(nn.Module):
         if config.use_moe:
             self.ffn = MoELayer(config)
         else:
-            self.ffn = SwiGLU(config.d_model, config.d_ff, config.dropout)
+            self.ffn = SwiGLU(config.d_model, config.d_ff)
 
         isolate = getattr(config, "block_residual_isolate_softmax", False)
         self.attn_res = BlockAttentionResidual(
@@ -219,7 +219,6 @@ class ResidualTransformer(nn.Module):
         self.layers_per_block = max(1, config.num_layers // config.num_blocks)
 
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.dropout = nn.Dropout(config.dropout)
 
         self.layers = nn.ModuleList([
             ResidualTransformerBlock(config) for _ in range(config.num_layers)
@@ -259,7 +258,6 @@ class ResidualTransformer(nn.Module):
         is_causal: bool = True,
     ) -> Dict[str, Any]:
         x = self.token_emb(input_ids)
-        x = self.dropout(x)
 
         # Embedding is "block 0"; the first block starts with no
         # accumulated partial (None), matching paper Eq. 6.
