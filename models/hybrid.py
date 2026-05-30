@@ -144,10 +144,17 @@ try:
         create_block_mask as _create_block_mask,
     )
     _HAS_FLEX = True
-    _flex_attention_fused = torch.compile(_flex_attention, dynamic=False)
+    _flex_attention_fused = torch.compile(_flex_attention, dynamic=True)
 except ImportError:
     _HAS_FLEX = False
     _flex_attention_fused = None
+try:
+    import torch._dynamo.config as _dynamo_config
+    for _attr in ("recompile_limit", "cache_size_limit"):
+        if hasattr(_dynamo_config, _attr):
+            setattr(_dynamo_config, _attr, max(64, getattr(_dynamo_config, _attr)))
+except Exception:
+    pass
 
 
 class LocalAttention(Attention):
