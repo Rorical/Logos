@@ -304,7 +304,7 @@ class TokenCompressor(nn.Module):
         mask: Optional[torch.Tensor],
         pos_bias: torch.Tensor,
         pad_front: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T, D = x.shape
         m = self.compression
         if mask is None:
@@ -368,11 +368,7 @@ class TokenCompressor(nn.Module):
         weights = torch.where(valid.unsqueeze(-1), weights, torch.zeros_like(weights))
         compressed = torch.sum(weights * values, dim=2)
         group_valid = valid.any(dim=2)
-        end_positions = torch.arange(
-            compressed.size(1), device=hidden.device, dtype=torch.long,
-        ) * self.compression + (self.compression - 1)
-        end_positions = end_positions.clamp(max=max(hidden.size(1) - 1, 0))
-        return compressed, group_valid, end_positions
+        return compressed, group_valid
 
 
 class CompressedGlobalAttention(nn.Module):
@@ -429,7 +425,6 @@ class CompressedGlobalAttention(nn.Module):
         q: torch.Tensor,
         kv: torch.Tensor,
         group_valid: torch.Tensor,
-        end_positions: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         is_causal: bool,
         hidden: torch.Tensor,
@@ -437,8 +432,19 @@ class CompressedGlobalAttention(nn.Module):
         scores = torch.einsum("bhtd,bnd->bhtn", q, kv) / (self.head_dim ** 0.5)
         B, H, T, G = scores.shape
         if is_causal:
-            t_idx = torch.arange(T, device=hidden.device)
-            causal = end_positions.view(1, 1, 1, G) <= t_idx.view(1, 1, T, 1)
+            t_idx = torch.arange(T, device=hidden.device, dtype=torch.long)
+            g_idx = torch.arange(G, device=hidden.device, dtype=torch.long)
+            complete_groups = torch.div(
+                t_idx + 1, self.compression, rounding_mode="floor",
+            )
+            causal = g_idx.view(1, 1, 1, G) < complete_groups.view(1, 1, T, 1)
+            if T % self.compression:
+                # Match the old clamped end-position behavior for the final
+                # partial compression group without forming compression*g+c.
+                causal = causal | (
+                    (t_idx.view(1, 1, T, 1) == (T - 1))
+                    & (g_idx.view(1, 1, 1, G) == (G - 1))
+                )
             scores = scores.masked_fill(~causal, float("-inf"))
         scores = scores.masked_fill(~group_valid.view(B, 1, 1, G), float("-inf"))
         if attention_mask is not None:
@@ -468,13 +474,13 @@ class CompressedGlobalAttention(nn.Module):
         is_causal: bool = True,
     ) -> torch.Tensor:
         B, T, _ = hidden.shape
-        kv, group_valid, end_positions = self.compressor(hidden, attention_mask)
+        kv, group_valid = self.compressor(hidden, attention_mask)
         kv = self.kv_norm(kv)
         q = self.q_up(self.q_down(hidden)).view(B, T, self.num_heads, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
 
         scores = self._build_scores(
-            q, kv, group_valid, end_positions, attention_mask, is_causal, hidden,
+            q, kv, group_valid, attention_mask, is_causal, hidden,
         )
         all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
         if self.attention_sink:
