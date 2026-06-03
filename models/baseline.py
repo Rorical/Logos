@@ -42,6 +42,8 @@ def _validate_moe_config(config) -> None:
         raise ValueError("expert_d_ff must be >= 1 when use_moe=True")
     if config.capacity_factor <= 0:
         raise ValueError("capacity_factor must be > 0 when use_moe=True")
+    if getattr(config, "router_logit_noise_std", 0.0) < 0:
+        raise ValueError("router_logit_noise_std must be >= 0 when use_moe=True")
 
 
 @dataclass
@@ -64,6 +66,7 @@ class BaselineConfig:
     expert_d_ff: int = 256
     bias_update_rate: float = 0.01
     capacity_factor: float = 2.0
+    router_logit_noise_std: float = 0.0
     # 0 keeps the standard full-logits CE. Positive values enable the
     # memory-efficient chunked LM-head CE in models that support it.
     lm_head_chunk_size: int = 0
@@ -256,6 +259,7 @@ class MoELayer(nn.Module):
         self.top_k = top_k
         self.bias_update_rate = config.bias_update_rate
         self.capacity_factor = config.capacity_factor
+        self.router_logit_noise_std = float(getattr(config, "router_logit_noise_std", 0.0))
         self.num_loops = num_loops
         self.diversity_factor = float(getattr(config, "moe_diversity_factor", 0.0))
 
@@ -307,8 +311,16 @@ class MoELayer(nn.Module):
 
         x_flat = x.view(-1, d_model)
 
-        # Top-K selection from biased logits.
-        _, topk_indices = torch.topk(biased_logits, K, dim=-1)
+        # Top-K selection from biased logits. Optional training-only noisy
+        # top-k breaks whole-layer ties when compressed/global attention
+        # produces low-diversity early router inputs; gates below still use
+        # clean raw logits so selected experts receive stable gradients.
+        selection_logits = biased_logits
+        if self.training and self.router_logit_noise_std > 0:
+            selection_logits = selection_logits + (
+                torch.randn_like(selection_logits) * self.router_logit_noise_std
+            )
+        _, topk_indices = torch.topk(selection_logits, K, dim=-1)
         # Gates from raw (unbiased) logits at the selected experts.
         selected_raw = raw_logits.gather(-1, topk_indices)
         topk_probs = F.softmax(selected_raw, dim=-1)

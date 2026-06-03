@@ -775,6 +775,7 @@ def build_model(args: argparse.Namespace, vocab_size: int):
         top_k=args.top_k,
         expert_d_ff=args.expert_d_ff,
         bias_update_rate=args.bias_update_rate,
+        router_logit_noise_std=args.router_logit_noise_std,
         moe_diversity_factor=args.moe_diversity_factor,
         lm_head_chunk_size=args.lm_head_chunk_size,
         block_residual_isolate_softmax=args.block_residual_isolate_softmax,
@@ -1924,6 +1925,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "applies the same router num_loops times). "
                              "Drop to 0.01 for non-looped baselines or "
                              "for tighter convergence late in training.")
+    parser.add_argument("--router-logit-noise-std", type=float, default=0.0,
+                        help="Training-only Gaussian noise std added to MoE "
+                             "router selection logits before top-k. Values "
+                             "around 0.1 break deterministic top-k ties when "
+                             "early hidden states are low-diversity, avoiding "
+                             "whole-layer 1/top_k expert collapse. Gate "
+                             "weights still use clean logits, and eval/"
+                             "inference routing is unchanged.")
     parser.add_argument("--block-residual-isolate-softmax", action="store_true",
                         help="Route the BlockAttentionResidual depth-softmax "
                              "+ weighted-sum through an opaque "

@@ -100,9 +100,13 @@ KDA_A_LOG_WARN_MIN = -4.0     # exp(-(-4)) = exp(4) → very fast decay
 KDA_A_LOG_WARN_MAX = 3.0      # exp(-3) = 0.05 → very slow decay
 KDA_DT_BIAS_WARN_NEG = -5.0   # dt_bias < -5 → softplus ≈ 0 → no decay updates
 
-# MoE expert load collapse.
-MOE_MAX_LOAD_WARN = 0.5
-MOE_MAX_LOAD_ALERT = 0.8
+# MoE expert load collapse. Thresholds are derived per layer from
+# uniform load (1/E), dispatch capacity (capacity_factor/E), and the hard
+# top-k maximum (1/K). These multipliers keep the check meaningful for
+# top_k=4, where the absolute hard maximum is only 0.25.
+MOE_CAPACITY_WARN_MULT = 1.25
+MOE_CAPACITY_ALERT_MULT = 1.75
+MOE_HARD_MAX_ALERT_FRAC = 0.90
 
 # Non-finite skip rate.
 SKIP_RATE_WARN = 0.01
@@ -524,6 +528,10 @@ class DiagnosticsMonitor:
         # Compute per-layer max load fraction (local approx — no all-reduce).
         max_loads: List[float] = []
         collapsed_layers: List[int] = []
+        concentrated_layers: List[int] = []
+        worst_alert_threshold = 0.0
+        worst_warn_threshold = 0.0
+        capacity_factor = float(getattr(config, "capacity_factor", 1.0))
         for i, topk in enumerate(topk_indices):
             if topk is None:
                 continue
@@ -534,8 +542,26 @@ class DiagnosticsMonitor:
             frac = counts / total
             max_frac = frac.max().item()
             max_loads.append(max_frac)
-            if max_frac > MOE_MAX_LOAD_ALERT:
+            layer_top_k = topk.shape[-1] if getattr(topk, "ndim", 0) > 0 else 1
+            capacity_frac = capacity_factor / num_experts
+            hard_max = 1.0 / max(1, int(layer_top_k))
+            warn_threshold = min(
+                hard_max,
+                max(2.0 / num_experts, MOE_CAPACITY_WARN_MULT * capacity_frac),
+            )
+            alert_threshold = min(
+                hard_max,
+                max(
+                    MOE_CAPACITY_ALERT_MULT * capacity_frac,
+                    MOE_HARD_MAX_ALERT_FRAC * hard_max,
+                ),
+            )
+            worst_warn_threshold = max(worst_warn_threshold, warn_threshold)
+            worst_alert_threshold = max(worst_alert_threshold, alert_threshold)
+            if max_frac >= alert_threshold:
                 collapsed_layers.append(i)
+            elif max_frac >= warn_threshold:
+                concentrated_layers.append(i)
 
         if not max_loads:
             return []
@@ -543,23 +569,28 @@ class DiagnosticsMonitor:
         global_max = max(max_loads)
         key = "moe_load_collapse"
 
-        if global_max >= MOE_MAX_LOAD_ALERT:
+        if collapsed_layers:
             issues.append(_Issue(
                 key=key, severe=True,
                 message=(
                     f"MoE expert load collapse: max load fraction = "
-                    f"{global_max:.3f} > {MOE_MAX_LOAD_ALERT} in "
+                    f"{global_max:.3f} >= alert threshold "
+                    f"~{worst_alert_threshold:.3f} in "
                     f"{len(collapsed_layers)} layer(s) "
                     f"({collapsed_layers[:5]}{'...' if len(collapsed_layers) > 5 else ''}). "
-                    f"Raise --bias-update-rate or increase --top-k."
+                    f"Enable/raise --router-logit-noise-std or inspect whether "
+                    f"the compressed-attention schedule is producing "
+                    f"low-diversity router inputs."
                 ),
             ))
-        elif global_max > MOE_MAX_LOAD_WARN:
+        elif concentrated_layers:
             issues.append(_Issue(
                 key=key, severe=False,
                 message=(
                     f"MoE expert load concentration: max load fraction = "
-                    f"{global_max:.3f} > {MOE_MAX_LOAD_WARN}. Monitor for collapse."
+                    f"{global_max:.3f} >= warn threshold "
+                    f"~{worst_warn_threshold:.3f} in "
+                    f"{len(concentrated_layers)} layer(s). Monitor for collapse."
                 ),
             ))
         else:
