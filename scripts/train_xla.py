@@ -421,6 +421,7 @@ def run_step_training_xla(
     save_dir: Path,
     sample_text_fn,
     total_steps: int,
+    start_step: int = 0,
 ) -> Dict[str, Any]:
     grad_clip = args.grad_clip
     log_every = max(1, args.log_every)
@@ -429,7 +430,11 @@ def run_step_training_xla(
 
     if main:
         print("\n" + "=" * 60)
-        print(f"XLA streaming training: {total_steps} steps | world_size={world_size}")
+        resume_note = f" | resuming at step {start_step}" if start_step else ""
+        print(
+            f"XLA streaming training: {total_steps} steps | "
+            f"world_size={world_size}" + resume_note
+        )
         print("=" * 60)
 
     history: list = []
@@ -437,9 +442,9 @@ def run_step_training_xla(
     running_loss = 0.0
     running_lm_loss = 0.0
     running_count = 0
-    step = 0
+    step = start_step
     t0 = time.time()
-    pbar = tqdm(total=total_steps, desc="train", disable=not main)
+    pbar = tqdm(total=total_steps, initial=start_step, desc="train", disable=not main)
 
     model.train(True)
     device_loader = pl.MpDeviceLoader(
@@ -519,7 +524,8 @@ def run_step_training_xla(
             avg_lm = running_lm_loss / running_count
             ppl = math.exp(min(avg_lm, 20))
             elapsed = time.time() - t0
-            tps = (step * args.batch_size * args.max_length * world_size) / max(elapsed, 1)
+            steps_this_run = step - start_step
+            tps = (steps_this_run * args.batch_size * args.max_length * world_size) / max(elapsed, 1)
             pbar.set_postfix({
                 "loss": f"{avg:.3f}",
                 "ppl": f"{ppl:.1f}",
@@ -893,6 +899,32 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
         if main_proc:
             print(f"  EMA enabled (decay={args.ema_decay}, use_buffers=True)")
 
+    start_step = 0
+    resume_arg = (args.resume or "none").strip()
+    if resume_arg.lower() != "none":
+        if resume_arg.lower() == "auto":
+            resume_path = base.find_latest_checkpoint(save_dir)
+        else:
+            resume_path = Path(resume_arg)
+            if not resume_path.exists():
+                raise FileNotFoundError(
+                    f"--resume path {resume_path} does not exist"
+                )
+        if resume_path is not None:
+            if main_proc:
+                print(f"  Resuming from {resume_path}")
+            # Load to CPU first; load_state_dict copies tensors into XLA params.
+            start_step = base.load_resume_checkpoint(
+                resume_path, raw_model, optimizer, scheduler,
+                muon_hp, ema_model, torch.device("cpu"),
+            )
+            if main_proc:
+                print(f"    resumed at step/epoch {start_step}")
+        elif main_proc and resume_arg.lower() == "auto":
+            print("  --resume auto: no prior checkpoint under "
+                  f"{save_dir}, starting fresh")
+    _xla_barrier(xm, "resume")
+
     def sample_text(prompt: str, max_new_tokens: int, temperature: float) -> str:
         raw_model.train(False)
         prompt_ids = torch.tensor(
@@ -911,7 +943,7 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
         result = run_step_training_xla(
             xm, pl, args, model, raw_model, optimizer, scheduler, muon_hp,
             ema_model, train_loader, val_loader, device, use_amp, mp_dtype,
-            save_dir, sample_text, total_steps,
+            save_dir, sample_text, total_steps, start_step=start_step,
         )
         history = result["history"]
         best_val_loss = result["best_val_loss"]
@@ -974,7 +1006,11 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
     train_metrics = None
     batches_per_execution = max(1, int(args.xla_batches_per_execution))
 
-    for epoch in range(1, args.epochs + 1):
+    if start_step >= args.epochs and main_proc:
+        print(f"  --resume target ({start_step}) is at or past --epochs "
+              f"({args.epochs}); nothing to train.")
+
+    for epoch in range(start_step + 1, args.epochs + 1):
         epoch_start = time.time()
         train_metrics = run_epoch_xla(
             xm, pl, model, raw_model, train_loader, optimizer, scheduler, device,
