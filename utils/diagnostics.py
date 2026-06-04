@@ -529,8 +529,8 @@ class DiagnosticsMonitor:
         max_loads: List[float] = []
         collapsed_layers: List[int] = []
         concentrated_layers: List[int] = []
-        worst_alert_threshold = 0.0
-        worst_warn_threshold = 0.0
+        collapsed_records: List[tuple[int, float, float]] = []
+        concentrated_records: List[tuple[int, float, float]] = []
         capacity_factor = float(getattr(config, "capacity_factor", 1.0))
         for i, topk in enumerate(topk_indices):
             if topk is None:
@@ -556,26 +556,28 @@ class DiagnosticsMonitor:
                     MOE_HARD_MAX_ALERT_FRAC * hard_max,
                 ),
             )
-            worst_warn_threshold = max(worst_warn_threshold, warn_threshold)
-            worst_alert_threshold = max(worst_alert_threshold, alert_threshold)
             if max_frac >= alert_threshold:
                 collapsed_layers.append(i)
+                collapsed_records.append((i, max_frac, alert_threshold))
             elif max_frac >= warn_threshold:
                 concentrated_layers.append(i)
+                concentrated_records.append((i, max_frac, warn_threshold))
 
         if not max_loads:
             return []
 
-        global_max = max(max_loads)
         key = "moe_load_collapse"
 
         if collapsed_layers:
+            layer_idx, layer_frac, layer_threshold = max(
+                collapsed_records, key=lambda item: item[1],
+            )
             issues.append(_Issue(
                 key=key, severe=True,
                 message=(
-                    f"MoE expert load collapse: max load fraction = "
-                    f"{global_max:.3f} >= alert threshold "
-                    f"~{worst_alert_threshold:.3f} in "
+                    f"MoE expert load collapse: worst layer {layer_idx} "
+                    f"load fraction = {layer_frac:.3f} >= its alert "
+                    f"threshold {layer_threshold:.3f}; "
                     f"{len(collapsed_layers)} layer(s) "
                     f"({collapsed_layers[:5]}{'...' if len(collapsed_layers) > 5 else ''}). "
                     f"Enable/raise --router-logit-noise-std or inspect whether "
@@ -584,12 +586,15 @@ class DiagnosticsMonitor:
                 ),
             ))
         elif concentrated_layers:
+            layer_idx, layer_frac, layer_threshold = max(
+                concentrated_records, key=lambda item: item[1],
+            )
             issues.append(_Issue(
                 key=key, severe=False,
                 message=(
-                    f"MoE expert load concentration: max load fraction = "
-                    f"{global_max:.3f} >= warn threshold "
-                    f"~{worst_warn_threshold:.3f} in "
+                    f"MoE expert load concentration: worst layer {layer_idx} "
+                    f"load fraction = {layer_frac:.3f} >= its warn "
+                    f"threshold {layer_threshold:.3f}; "
                     f"{len(concentrated_layers)} layer(s). Monitor for collapse."
                 ),
             ))

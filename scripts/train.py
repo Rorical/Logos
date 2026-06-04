@@ -1927,12 +1927,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "for tighter convergence late in training.")
     parser.add_argument("--router-logit-noise-std", type=float, default=0.0,
                         help="Training-only Gaussian noise std added to MoE "
-                             "router selection logits before top-k. Values "
+                             "router selection scores before top-k. Values "
                              "around 0.1 break deterministic top-k ties when "
-                             "early hidden states are low-diversity, avoiding "
-                             "whole-layer 1/top_k expert collapse. Gate "
-                             "weights still use clean logits, and eval/"
-                             "inference routing is unchanged.")
+                             "early hidden states are low-diversity. Gate "
+                             "weights still use clean bounded scores, and "
+                             "eval/inference routing is unchanged.")
     parser.add_argument("--block-residual-isolate-softmax", action="store_true",
                         help="Route the BlockAttentionResidual depth-softmax "
                              "+ weighted-sum through an opaque "

@@ -293,16 +293,13 @@ class MoELayer(nn.Module):
         E = self.num_sparse_experts
         K = self.top_k
 
-        # Canonical DeepSeek-V3 routing: bias steers selection only; gate
-        # values come from the unbiased logits so the bias-balancing loop
-        # can rebalance load without simultaneously suppressing the
-        # gradient signal flowing back to the over-used expert. Pre-fix
-        # behaviour added bias to logits, softmaxed, and used those probs
-        # both for top-K and for gates — which meant lowering bias[e]
-        # also lowered e's gate, starving e of training signal and
-        # locking in the load asymmetry.
+        # Canonical DeepSeek-V3 routing: bounded sigmoid affinities drive
+        # top-k selection, while the balance bias only steers selection.
+        # Gates come from the clean affinities so lowering bias[e] for an
+        # over-used expert does not also suppress e's gradient signal.
         raw_logits = self.router(x)
-        biased_logits = raw_logits + self.bias[loop_idx]
+        router_scores = raw_logits.sigmoid()
+        biased_scores = router_scores + self.bias[loop_idx]
 
         shared_out = sum(expert(x) for expert in self.shared_experts) / self.num_shared_experts
 
@@ -311,19 +308,21 @@ class MoELayer(nn.Module):
 
         x_flat = x.view(-1, d_model)
 
-        # Top-K selection from biased logits. Optional training-only noisy
+        # Top-K selection from biased scores. Optional training-only noisy
         # top-k breaks whole-layer ties when compressed/global attention
         # produces low-diversity early router inputs; gates below still use
-        # clean raw logits so selected experts receive stable gradients.
-        selection_logits = biased_logits
+        # clean scores so selected experts receive stable gradients.
+        selection_scores = biased_scores
         if self.training and self.router_logit_noise_std > 0:
-            selection_logits = selection_logits + (
-                torch.randn_like(selection_logits) * self.router_logit_noise_std
+            selection_scores = selection_scores + (
+                torch.randn_like(selection_scores) * self.router_logit_noise_std
             )
-        _, topk_indices = torch.topk(selection_logits, K, dim=-1)
-        # Gates from raw (unbiased) logits at the selected experts.
-        selected_raw = raw_logits.gather(-1, topk_indices)
-        topk_probs = F.softmax(selected_raw, dim=-1)
+        _, topk_indices = torch.topk(selection_scores, K, dim=-1)
+        # Gates from clean bounded scores at the selected experts.
+        selected_scores = router_scores.gather(-1, topk_indices)
+        topk_probs = selected_scores / selected_scores.sum(
+            dim=-1, keepdim=True,
+        ).clamp_min(1e-9)
 
         topk_indices_flat = topk_indices.view(-1)
         topk_probs_flat = topk_probs.view(-1)
