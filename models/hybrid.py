@@ -22,6 +22,7 @@ from models.baseline import (
     Attention,
     SwiGLU,
     MoELayer,
+    combine_lm_and_aux_loss,
     init_moe_router_weights,
     count_parameters,
     model_summary,
@@ -634,7 +635,7 @@ class HybridTransformer(nn.Module):
         x = self.final_norm(x)
         logits = self.lm_head(x)
 
-        loss: Optional[torch.Tensor] = None
+        lm_loss: Optional[torch.Tensor] = None
         if labels is not None:
             shift_logits = logits[..., :-1, :]
             shift_labels = labels[..., 1:]
@@ -645,11 +646,17 @@ class HybridTransformer(nn.Module):
                 ignore_index=-100,
                 reduction="sum",
             )
-            loss = loss_sum / (flat_labels != -100).sum().clamp_min(1)
+            lm_loss = loss_sum / (flat_labels != -100).sum().clamp_min(1)
+        loss = combine_lm_and_aux_loss(
+            lm_loss,
+            aux_loss if self.config.use_moe else None,
+            self.training,
+        )
 
         return {
             "logits": logits,
             "loss": loss,
+            "lm_loss": lm_loss,
             "aux_loss": aux_loss if self.config.use_moe else None,
             "topk_indices": topk_indices_list if self.config.use_moe else None,
         }

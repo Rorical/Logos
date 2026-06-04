@@ -26,6 +26,7 @@ from models.baseline import (
     RMSNorm,
     SwiGLU,
     MoELayer,
+    combine_lm_and_aux_loss,
     init_moe_router_weights,
     count_parameters,
     model_summary,
@@ -423,13 +424,19 @@ class LogosTransformer(nn.Module):
         )
         logits = None if use_chunked_lm_loss else self.lm_head(x)
 
-        loss: Optional[torch.Tensor] = None
+        lm_loss: Optional[torch.Tensor] = None
         if labels is not None:
-            loss = self._lm_loss(x, labels, logits=logits)
+            lm_loss = self._lm_loss(x, labels, logits=logits)
+        loss = combine_lm_and_aux_loss(
+            lm_loss,
+            aux_loss if self.config.use_moe else None,
+            self.training,
+        )
 
         return {
             "logits": logits,
             "loss": loss,
+            "lm_loss": lm_loss,
             "aux_loss": aux_loss if self.config.use_moe else None,
             "topk_indices": topk_indices_list if self.config.use_moe else None,
         }

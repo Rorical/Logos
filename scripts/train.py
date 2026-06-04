@@ -26,7 +26,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from models.baseline import BaselineConfig, BaselineTransformer, count_parameters
+from models.baseline import (
+    BaselineConfig,
+    BaselineTransformer,
+    count_parameters,
+    set_moe_training_step,
+)
 from models.linear import LinearConfig, LinearTransformer
 from models.recursive import RecursiveConfig, RecursiveTransformer
 from models.residual import ResidualConfig, ResidualTransformer
@@ -198,7 +203,9 @@ def _moe_layer_names(args: argparse.Namespace, n_entries: int) -> list:
 
 
 def _moe_load_metrics(
-    topk_indices: torch.Tensor, num_experts: int,
+    topk_indices: torch.Tensor,
+    num_experts: int,
+    capacity_factor: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Per-MoE-layer load distribution. Uses ``bincount`` over the flat
     expert-id stream (cheaper than the ``one_hot`` round-trip). Returns
@@ -218,12 +225,20 @@ def _moe_load_metrics(
     # KL(frac || uniform) — peaks when load concentrates on few experts.
     eps = 1e-12
     kl = (frac * (torch.log(frac + eps) - math.log(target))).sum()
+    entropy = -(frac * torch.log(frac + eps)).sum() / math.log(max(num_experts, 2))
+    overflow_frac = torch.zeros((), device=frac.device, dtype=frac.dtype)
+    if capacity_factor is not None and capacity_factor > 0:
+        capacity = max(1, int(topk_indices.numel() * capacity_factor / num_experts))
+        overflow = (counts - capacity).clamp_min(0).sum()
+        overflow_frac = overflow / total
     scalars = torch.stack([
         frac.max(),
         frac.min(),
         frac.std(),
         (counts == 0).sum().to(frac.dtype),
         kl,
+        entropy,
+        overflow_frac,
     ]).detach().cpu().tolist()
     return {
         "frac": frac.detach().cpu(),
@@ -232,6 +247,8 @@ def _moe_load_metrics(
         "load_std": scalars[2],
         "dead_experts": int(scalars[3]),
         "kl_uniform": scalars[4],
+        "load_entropy_norm": scalars[5],
+        "capacity_overflow_frac": scalars[6],
     }
 
 
@@ -258,13 +275,15 @@ def log_moe_load(
     for name, topk in zip(names, topk_indices_list):
         if topk is None:
             continue
-        m = _moe_load_metrics(topk, num_experts)
+        m = _moe_load_metrics(topk, num_experts, args.capacity_factor)
         prefix = f"moe/{name}"
         metrics[f"{prefix}/load_max"] = m["load_max"]
         metrics[f"{prefix}/load_min"] = m["load_min"]
         metrics[f"{prefix}/load_std"] = m["load_std"]
         metrics[f"{prefix}/dead_experts"] = m["dead_experts"]
         metrics[f"{prefix}/kl_uniform"] = m["kl_uniform"]
+        metrics[f"{prefix}/load_entropy_norm"] = m["load_entropy_norm"]
+        metrics[f"{prefix}/capacity_overflow_frac"] = m["capacity_overflow_frac"]
         import wandb
         metrics[f"{prefix}/load_hist"] = wandb.Histogram(
             sequence=m["frac"].tolist(), num_bins=num_experts,
@@ -405,6 +424,29 @@ def _moe_max_load_local(
     # then reduce on the CPU side.
     per_layer = torch.stack(fractions).cpu().tolist()
     return max(per_layer), per_layer
+
+
+def _moe_runtime_scalar_stats(model: nn.Module) -> Dict[str, float]:
+    """Current non-persistent MoE controller scales for logging."""
+    noise_vals: list = []
+    aux_vals: list = []
+    for mod in model.modules():
+        noise = getattr(mod, "router_noise_scale", None)
+        aux = getattr(mod, "moe_aux_loss_scale", None)
+        if isinstance(noise, torch.Tensor):
+            noise_vals.append(noise.detach().float())
+        if isinstance(aux, torch.Tensor):
+            aux_vals.append(aux.detach().float())
+    stats: Dict[str, float] = {}
+    if noise_vals:
+        vals = torch.stack(noise_vals).cpu().tolist()
+        stats["noise_mean"] = sum(vals) / len(vals)
+        stats["noise_max"] = max(vals)
+    if aux_vals:
+        vals = torch.stack(aux_vals).cpu().tolist()
+        stats["aux_scale_mean"] = sum(vals) / len(vals)
+        stats["aux_scale_max"] = max(vals)
+    return stats
 
 
 MODEL_REGISTRY: Dict[str, tuple] = {
@@ -776,7 +818,12 @@ def build_model(args: argparse.Namespace, vocab_size: int):
         expert_d_ff=args.expert_d_ff,
         bias_update_rate=args.bias_update_rate,
         router_logit_noise_std=args.router_logit_noise_std,
+        router_logit_noise_decay_steps=args.router_logit_noise_decay_steps,
         router_init_std=args.router_init_std,
+        router_bias_error_clip=args.router_bias_error_clip,
+        router_bias_clip=args.router_bias_clip,
+        moe_aux_loss_weight=args.moe_aux_loss_weight,
+        moe_aux_loss_decay_steps=args.moe_aux_loss_decay_steps,
         moe_diversity_factor=args.moe_diversity_factor,
         lm_head_chunk_size=args.lm_head_chunk_size,
         block_residual_isolate_softmax=args.block_residual_isolate_softmax,
@@ -984,6 +1031,8 @@ def run_epoch(
     # epoch (plus a throttled postfix sync every ``log_every`` steps for
     # the progress bar) replaces what used to be one sync per step.
     total_loss_t = torch.zeros((), device=device, dtype=torch.float64)
+    total_lm_loss_t = torch.zeros((), device=device, dtype=torch.float64)
+    total_aux_loss_t = torch.zeros((), device=device, dtype=torch.float64)
     num_batches = 0
     log_every = max(1, log_every)
 
@@ -1008,6 +1057,11 @@ def run_epoch(
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
+            inner = getattr(model, "_orig_mod", model)
+            set_moe_training_step(
+                inner,
+                max(0, (epoch - 1) * len(dataloader) + step),
+            )
 
         # Eval needs no_grad so activations don't pile up across iterations.
         grad_ctx = contextlib.nullcontext() if is_train else torch.no_grad()
@@ -1022,6 +1076,11 @@ def run_epoch(
             )
 
         loss = outputs["loss"]
+        lm_loss_t = outputs.get("lm_loss")
+        lm_loss = lm_loss_t if lm_loss_t is not None else loss
+        aux_loss = outputs.get("aux_loss")
+        if aux_loss is None:
+            aux_loss = torch.zeros((), device=loss.device, dtype=loss.dtype)
 
         if is_train:
             loss.backward()
@@ -1033,11 +1092,12 @@ def run_epoch(
             if muon_hp is not None:
                 muon_hp.step()
 
-            # Without this call, MoE bias stays at zero init forever and
-            # aux-loss-free balancing never activates.
+            # Without this call, MoE bias stays at zero init forever and the
+            # post-step balance controller never activates.
             topk_indices = outputs.get("topk_indices")
             if topk_indices is not None:
-                model.update_router_biases(topk_indices)
+                inner = getattr(model, "_orig_mod", model)
+                inner.update_router_biases(topk_indices)
 
             if ema_model is not None:
                 # AveragedModel was built around the uncompiled module;
@@ -1051,25 +1111,40 @@ def run_epoch(
         # by the addition kernel before the next ``cudagraph_mark_step_begin``
         # so the CUDA-graph output pool is safe to reuse on the next replay.
         total_loss_t += loss.detach().to(torch.float64) * batch_size
+        total_lm_loss_t += lm_loss.detach().to(torch.float64) * batch_size
+        total_aux_loss_t += aux_loss.detach().to(torch.float64) * batch_size
         num_batches += batch_size
 
         if main and step % log_every == 0:
             loss_val = loss.detach().float().item()
+            lm_loss_val = lm_loss.detach().float().item()
+            aux_loss_val = aux_loss.detach().float().item()
             pbar.set_postfix({
                 "loss": f"{loss_val:.4f}",
-                "ppl": f"{math.exp(min(loss_val, 20)):.2f}",
+                "lm": f"{lm_loss_val:.4f}",
+                "aux": f"{aux_loss_val:.2e}",
+                "ppl": f"{math.exp(min(lm_loss_val, 20)):.2f}",
                 "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
             })
 
     pbar.close()
 
     total_loss = total_loss_t.item()
+    total_lm_loss = total_lm_loss_t.item()
+    total_aux_loss = total_aux_loss_t.item()
 
     if num_batches == 0:
         return {"loss": float("inf"), "ppl": float("inf")}
 
     avg_loss = total_loss / num_batches
-    return {"loss": avg_loss, "ppl": math.exp(min(avg_loss, 20))}
+    avg_lm_loss = total_lm_loss / num_batches
+    avg_aux_loss = total_aux_loss / num_batches
+    return {
+        "loss": avg_loss,
+        "lm_loss": avg_lm_loss,
+        "aux_loss": avg_aux_loss,
+        "ppl": math.exp(min(avg_lm_loss, 20)),
+    }
 
 
 def prune_old_checkpoints(save_dir: Path, keep_last_n: int) -> None:
@@ -1530,6 +1605,8 @@ def run_step_training(
     history: list = []
     best_val_loss = float("inf")
     running_loss = 0.0
+    running_lm_loss = 0.0
+    running_aux_loss = 0.0
     running_count = 0
     nonfinite_skips = 0
     nonfinite_warned = False
@@ -1566,9 +1643,15 @@ def run_step_training(
         lbls = batch["labels"].to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
+        set_moe_training_step(raw_model, step)
         with torch.autocast(device_type=device.type, dtype=mp_dtype, enabled=use_amp):
             outputs = model(input_ids=ids, attention_mask=None, labels=lbls, is_causal=True)
         loss = outputs["loss"]
+        lm_loss_t = outputs.get("lm_loss")
+        lm_loss = lm_loss_t if lm_loss_t is not None else loss
+        aux_loss = outputs.get("aux_loss")
+        if aux_loss is None:
+            aux_loss = torch.zeros((), device=loss.device, dtype=loss.dtype)
         loss.backward()
         # Per-group pre-clip norms so wandb can plot them and a single
         # high-LR group (embed) doesn't dominate a global clip and
@@ -1638,20 +1721,27 @@ def run_step_training(
         # grad_norm to pull everything to CPU in a single sync instead of
         # multiple .item() stalls.
         loss_d = loss.detach().reshape(1)
+        lm_loss_d = lm_loss.detach().reshape(1)
+        aux_loss_d = aux_loss.detach().reshape(1)
         if grad_norm is not None:
-            # Single device->host sync for loss + global grad norm + per-
-            # group grad norms. Keeps rank-0 wandb logging cheap even
-            # though we now expose one metric per param group.
-            stack_parts = [loss_d, grad_norm.detach().reshape(1)]
+            # Single device->host sync for loss scalars + global grad norm +
+            # per-group grad norms. Keeps rank-0 wandb logging cheap even
+            # though we expose one metric per param group.
+            stack_parts = [loss_d, lm_loss_d, aux_loss_d, grad_norm.detach().reshape(1)]
             stack_parts.extend(
                 n.detach().reshape(1) for n in per_group_grad_norms
             )
             scalars = torch.cat(stack_parts).cpu().tolist()
             loss_val = scalars[0]
-            grad_norm_val = scalars[1]
-            per_group_grad_norm_vals = scalars[2:]
+            lm_loss_val = scalars[1]
+            aux_loss_val = scalars[2]
+            grad_norm_val = scalars[3]
+            per_group_grad_norm_vals = scalars[4:]
         else:
-            loss_val = loss_d.cpu().item()
+            scalars = torch.cat([loss_d, lm_loss_d, aux_loss_d]).cpu().tolist()
+            loss_val = scalars[0]
+            lm_loss_val = scalars[1]
+            aux_loss_val = scalars[2]
             grad_norm_val = None
             per_group_grad_norm_vals = []
         # Exclude non-finite losses from the running average so a single
@@ -1659,6 +1749,8 @@ def run_step_training(
         # tracks finite contributions only.
         if math.isfinite(loss_val):
             running_loss += loss_val
+            running_lm_loss += lm_loss_val
+            running_aux_loss += aux_loss_val
             running_count += 1
         pbar.update(1)
 
@@ -1670,7 +1762,9 @@ def run_step_training(
             tokens_seen = step * args.batch_size * args.max_length
             metrics = {
                 "train/loss": loss_val,
-                "train/ppl": math.exp(min(loss_val, 20)),
+                "train/lm_loss": lm_loss_val,
+                "train/aux_loss": aux_loss_val,
+                "train/ppl": math.exp(min(lm_loss_val, 20)),
                 "train/tokens_seen": tokens_seen,
             }
             for i, pg in enumerate(optimizer.param_groups):
@@ -1689,17 +1783,24 @@ def run_step_training(
         if step % log_every == 0 and main:
             if running_count > 0:
                 avg = running_loss / running_count
-                ppl = math.exp(min(avg, 20))
+                avg_lm = running_lm_loss / running_count
+                avg_aux = running_aux_loss / running_count
+                ppl = math.exp(min(avg_lm, 20))
             else:
                 avg = float("nan")
+                avg_lm = float("nan")
+                avg_aux = float("nan")
                 ppl = float("nan")
-            running_avg = avg  # save for diagnostics
+            running_avg = avg_lm  # save LM loss for diagnostics/plateau checks
             elapsed = time.time() - t0
             # Tokens/sec for the current run, counting only post-resume steps.
             steps_this_run = step - start_step
             tps = (steps_this_run * args.batch_size * args.max_length) / max(elapsed, 1)
             postfix = {
-                "loss": f"{avg:.3f}", "ppl": f"{ppl:.1f}",
+                "loss": f"{avg:.3f}",
+                "lm": f"{avg_lm:.3f}",
+                "aux": f"{avg_aux:.1e}",
+                "ppl": f"{ppl:.1f}",
                 "lr": f"{optimizer.param_groups[0]['lr']:.1e}",
                 "tok/s": f"{tps:.0f}",
             }
@@ -1719,17 +1820,35 @@ def run_step_training(
                 wandb_extra["train/moe_max_load_local"] = moe_max
                 for i, val in enumerate(moe_per_layer):
                     wandb_extra[f"train/moe_max_load_layer_{i:02d}"] = val
+            if args.use_moe and hasattr(raw_model, "get_balance_stats"):
+                balance = raw_model.get_balance_stats()
+                bias_max_vals = [v for k, v in balance.items() if "bias_max" in k]
+                bias_mean_vals = [v for k, v in balance.items() if "bias_mean" in k]
+                if bias_max_vals:
+                    bias_max = max(bias_max_vals)
+                    postfix["bias_max"] = f"{bias_max:.2f}"
+                    wandb_extra["train/moe_bias_max"] = bias_max
+                if bias_mean_vals:
+                    wandb_extra["train/moe_bias_mean"] = (
+                        sum(bias_mean_vals) / len(bias_mean_vals)
+                    )
+                for k, v in _moe_runtime_scalar_stats(raw_model).items():
+                    wandb_extra[f"train/moe_{k}"] = v
             if nonfinite_skips:
                 postfix["skips"] = str(nonfinite_skips)
                 wandb_extra["train/nonfinite_skips"] = nonfinite_skips
             pbar.set_postfix(postfix)
             wandb_log({
                 "train/avg_loss": avg,
+                "train/avg_lm_loss": avg_lm,
+                "train/avg_aux_loss": avg_aux,
                 "train/avg_ppl": ppl,
                 "train/tok_per_sec": tps,
                 **wandb_extra,
             }, step=step)
             running_loss = 0.0
+            running_lm_loss = 0.0
+            running_aux_loss = 0.0
             running_count = 0
 
         # --- Training-dynamics diagnostics ---
@@ -1918,27 +2037,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "0.5–1.0 to encourage different expert "
                              "selections per loop step.")
     parser.add_argument("--bias-update-rate", type=float, default=0.02,
-                        help="DeepSeek-style router bias update rate. "
-                             "0.02 (default) gives the bias-balance loop "
-                             "enough authority to outpace router-weight "
-                             "drift under the body-loop sharing in "
-                             "``logos`` / ``recursive`` (each forward "
-                             "applies the same router num_loops times). "
-                             "Drop to 0.01 for non-looped baselines or "
-                             "for tighter convergence late in training.")
-    parser.add_argument("--router-logit-noise-std", type=float, default=0.0,
-                        help="Training-only Gaussian noise std added to MoE "
-                             "router selection scores before top-k. Values "
-                             "around 0.1 break deterministic top-k ties when "
-                             "early hidden states are low-diversity. Gate "
-                             "weights still use clean bounded scores, and "
-                             "eval/inference routing is unchanged.")
+                        help="Router bias update rate for the bounded relative "
+                             "load controller. 0.02 gives each under-used "
+                             "expert enough positive bias to recover from "
+                             "early top-k collapse without unbounded drift.")
+    parser.add_argument("--router-bias-error-clip", type=float, default=1.0,
+                        help="Clip for relative router-bias load error. 1.0 "
+                             "means one bias-update step can move a row by at "
+                             "most +/- --bias-update-rate before centering.")
+    parser.add_argument("--router-bias-clip", type=float, default=1.0,
+                        help="Absolute clamp for MoE router balance bias after "
+                             "each centered update.")
+    parser.add_argument("--router-logit-noise-std", type=float, default=0.1,
+                        help="Initial training-only Gaussian noise std added "
+                             "to MoE router selection scores before top-k. "
+                             "The effective std decays via "
+                             "--router-logit-noise-decay-steps. Gate weights "
+                             "still use clean bounded scores, and eval routing "
+                             "is unchanged.")
+    parser.add_argument("--router-logit-noise-decay-steps", type=int, default=2000,
+                        help="Linearly decay router selection noise to zero "
+                             "over this many optimizer steps. 0 keeps the "
+                             "initial noise constant.")
     parser.add_argument("--router-init-std", type=float, default=0.002,
                         help="Initialization std for MoE Router.linear.weight. "
                              "Routers start smaller than content projections "
                              "so early low-diversity hidden states do not "
                              "lock every token into the same random top-k "
                              "expert set before bias balancing catches up.")
+    parser.add_argument("--moe-aux-loss-weight", type=float, default=1e-3,
+                        help="Initial weight for the differentiable MoE "
+                             "load/importance auxiliary regularizer. 0 "
+                             "disables it.")
+    parser.add_argument("--moe-aux-loss-decay-steps", type=int, default=2000,
+                        help="Linearly decay the MoE auxiliary regularizer to "
+                             "zero over this many optimizer steps. 0 keeps it "
+                             "constant.")
     parser.add_argument("--block-residual-isolate-softmax", action="store_true",
                         help="Route the BlockAttentionResidual depth-softmax "
                              "+ weighted-sum through an opaque "

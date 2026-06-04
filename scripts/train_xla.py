@@ -32,6 +32,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 base = importlib.import_module("scripts.train")
+baseline_mod = importlib.import_module("models.baseline")
 
 
 def _import_xla():
@@ -100,6 +101,7 @@ def _patch_base_process_helpers(xm) -> None:
     base.is_main_process = lambda: _xla_is_main(xm)
     base.barrier = lambda: _xla_barrier(xm)
     base.all_reduce_mean = lambda t: _xla_all_reduce_mean(xm, t)
+    baseline_mod._maybe_all_reduce_load = lambda t: _xla_all_reduce_sum(xm, t)
 
 
 def _xla_autocast(enabled: bool, dtype: torch.dtype):
@@ -177,14 +179,20 @@ def save_final_xla(
     return path
 
 
-def _reduce_loss_pair(
+def _reduce_loss_triplet(
     xm,
     loss: torch.Tensor,
     lm_loss: Optional[torch.Tensor],
+    aux_loss: Optional[torch.Tensor],
 ) -> list[float]:
     pair = torch.stack([
         loss.detach(),
         (lm_loss if lm_loss is not None else loss).detach(),
+        (
+            aux_loss.detach()
+            if aux_loss is not None
+            else torch.zeros((), device=loss.device, dtype=loss.dtype)
+        ),
     ])
     pair = _xla_all_reduce_mean(xm, pair)
     return pair.cpu().tolist()
@@ -281,6 +289,7 @@ def run_epoch_xla(
     main = _xla_is_main(xm)
     total_loss = 0.0
     total_lm_loss = 0.0
+    total_aux_loss = 0.0
     num_examples = 0
     device_loader = pl.MpDeviceLoader(
         dataloader, device, batches_per_execution=batches_per_execution,
@@ -293,11 +302,15 @@ def run_epoch_xla(
         disable=not main,
     )
 
-    for batch in pbar:
+    for step_in_epoch, batch in enumerate(pbar):
         input_ids = batch["input_ids"]
         labels = batch["labels"]
         if is_train:
             optimizer.zero_grad(set_to_none=True)
+            base.set_moe_training_step(
+                raw_model,
+                max(0, (epoch - 1) * len(dataloader) + step_in_epoch),
+            )
 
         grad_ctx = contextlib.nullcontext() if is_train else torch.no_grad()
         with grad_ctx, _xla_autocast(use_amp, mp_dtype):
@@ -324,35 +337,52 @@ def run_epoch_xla(
                 ema_model.update_parameters(raw_model)
 
         batch_size = input_ids.size(0)
-        loss_val, lm_loss_val = _reduce_loss_pair(xm, loss, outputs.get("lm_loss"))
+        loss_val, lm_loss_val, aux_loss_val = _reduce_loss_triplet(
+            xm, loss, outputs.get("lm_loss"), outputs.get("aux_loss"),
+        )
         total_loss += loss_val * batch_size
         total_lm_loss += lm_loss_val * batch_size
+        total_aux_loss += aux_loss_val * batch_size
         num_examples += batch_size
         if main:
             pbar.set_postfix({
                 "loss": f"{loss_val:.4f}",
+                "lm": f"{lm_loss_val:.4f}",
+                "aux": f"{aux_loss_val:.2e}",
                 "ppl": f"{math.exp(min(lm_loss_val, 20)):.2f}",
                 "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
             })
 
     pbar.close()
     agg = torch.tensor(
-        [total_loss, total_lm_loss, float(num_examples)],
+        [total_loss, total_lm_loss, total_aux_loss, float(num_examples)],
         dtype=torch.float64,
         device=device,
     )
     agg = _xla_all_reduce_sum(xm, agg)
     total_loss = agg[0].item()
     total_lm_loss = agg[1].item()
-    num_examples = int(agg[2].item())
+    total_aux_loss = agg[2].item()
+    num_examples = int(agg[3].item())
     if num_examples == 0:
         return {"loss": float("inf"), "ppl": float("inf")}
     avg_loss = total_loss / num_examples
     avg_lm_loss = total_lm_loss / num_examples
-    return {"loss": avg_loss, "ppl": math.exp(min(avg_lm_loss, 20))}
+    avg_aux_loss = total_aux_loss / num_examples
+    return {
+        "loss": avg_loss,
+        "lm_loss": avg_lm_loss,
+        "aux_loss": avg_aux_loss,
+        "ppl": math.exp(min(avg_lm_loss, 20)),
+    }
 
 
-def _moe_load_metrics_xla(xm, topk_indices: torch.Tensor, num_experts: int) -> Dict[str, Any]:
+def _moe_load_metrics_xla(
+    xm,
+    topk_indices: torch.Tensor,
+    num_experts: int,
+    capacity_factor: Optional[float] = None,
+) -> Dict[str, Any]:
     counts = torch.bincount(topk_indices.reshape(-1), minlength=num_experts).float()
     counts = _xla_all_reduce_sum(xm, counts)
     total = counts.sum().clamp(min=1.0)
@@ -360,12 +390,20 @@ def _moe_load_metrics_xla(xm, topk_indices: torch.Tensor, num_experts: int) -> D
     target = 1.0 / num_experts
     eps = 1e-12
     kl = (frac * (torch.log(frac + eps) - math.log(target))).sum()
+    entropy = -(frac * torch.log(frac + eps)).sum() / math.log(max(num_experts, 2))
+    overflow_frac = torch.zeros((), device=frac.device, dtype=frac.dtype)
+    if capacity_factor is not None and capacity_factor > 0:
+        capacity = max(1, int(topk_indices.numel() * capacity_factor / num_experts))
+        overflow = (counts - capacity).clamp_min(0).sum()
+        overflow_frac = overflow / total
     scalars = torch.stack([
         frac.max(),
         frac.min(),
         frac.std(),
         (counts == 0).sum().to(frac.dtype),
         kl,
+        entropy,
+        overflow_frac,
     ]).detach().cpu().tolist()
     return {
         "frac": frac.detach().cpu(),
@@ -374,6 +412,8 @@ def _moe_load_metrics_xla(xm, topk_indices: torch.Tensor, num_experts: int) -> D
         "load_std": scalars[2],
         "dead_experts": int(scalars[3]),
         "kl_uniform": scalars[4],
+        "load_entropy_norm": scalars[5],
+        "capacity_overflow_frac": scalars[6],
     }
 
 
@@ -385,7 +425,9 @@ def log_moe_load_xla(xm, args: argparse.Namespace, topk_indices_list, step: int)
     for name, topk in zip(names, topk_indices_list):
         if topk is None:
             continue
-        m = _moe_load_metrics_xla(xm, topk, args.num_sparse_experts)
+        m = _moe_load_metrics_xla(
+            xm, topk, args.num_sparse_experts, args.capacity_factor,
+        )
         if not _xla_is_main(xm):
             continue
         prefix = f"moe/{name}"
@@ -394,6 +436,8 @@ def log_moe_load_xla(xm, args: argparse.Namespace, topk_indices_list, step: int)
         metrics[f"{prefix}/load_std"] = m["load_std"]
         metrics[f"{prefix}/dead_experts"] = m["dead_experts"]
         metrics[f"{prefix}/kl_uniform"] = m["kl_uniform"]
+        metrics[f"{prefix}/load_entropy_norm"] = m["load_entropy_norm"]
+        metrics[f"{prefix}/capacity_overflow_frac"] = m["capacity_overflow_frac"]
         import wandb
 
         metrics[f"{prefix}/load_hist"] = wandb.Histogram(
@@ -441,6 +485,7 @@ def run_step_training_xla(
     best_val_loss = float("inf")
     running_loss = 0.0
     running_lm_loss = 0.0
+    running_aux_loss = 0.0
     running_count = 0
     step = start_step
     t0 = time.time()
@@ -468,6 +513,7 @@ def run_step_training_xla(
         ids = batch["input_ids"]
         lbls = batch["labels"]
         optimizer.zero_grad(set_to_none=True)
+        base.set_moe_training_step(raw_model, step)
         with _xla_autocast(use_amp, mp_dtype):
             outputs = model(input_ids=ids, attention_mask=None, labels=lbls, is_causal=True)
         loss = outputs["loss"]
@@ -492,10 +538,13 @@ def run_step_training_xla(
             log_moe_load_xla(xm, args, topk_indices, step + 1)
 
         step += 1
-        loss_val, lm_loss_val = _reduce_loss_pair(xm, loss, outputs.get("lm_loss"))
+        loss_val, lm_loss_val, aux_loss_val = _reduce_loss_triplet(
+            xm, loss, outputs.get("lm_loss"), outputs.get("aux_loss"),
+        )
         grad_norm_val = grad_norm.detach().cpu().item() if grad_norm is not None else None
         running_loss += loss_val
         running_lm_loss += lm_loss_val
+        running_aux_loss += aux_loss_val
         running_count += 1
         if main:
             pbar.update(1)
@@ -505,6 +554,7 @@ def run_step_training_xla(
             metrics = {
                 "train/loss": loss_val,
                 "train/lm_loss": lm_loss_val,
+                "train/aux_loss": aux_loss_val,
                 "train/ppl": math.exp(min(lm_loss_val, 20)),
                 "train/tokens_seen": tokens_seen,
             }
@@ -522,23 +572,29 @@ def run_step_training_xla(
         if step % log_every == 0 and main:
             avg = running_loss / running_count
             avg_lm = running_lm_loss / running_count
+            avg_aux = running_aux_loss / running_count
             ppl = math.exp(min(avg_lm, 20))
             elapsed = time.time() - t0
             steps_this_run = step - start_step
             tps = (steps_this_run * args.batch_size * args.max_length * world_size) / max(elapsed, 1)
             pbar.set_postfix({
                 "loss": f"{avg:.3f}",
+                "lm": f"{avg_lm:.3f}",
+                "aux": f"{avg_aux:.1e}",
                 "ppl": f"{ppl:.1f}",
                 "lr": f"{optimizer.param_groups[0]['lr']:.1e}",
                 "tok/s": f"{tps:.0f}",
             })
             base.wandb_log({
                 "train/avg_loss": avg,
+                "train/avg_lm_loss": avg_lm,
+                "train/avg_aux_loss": avg_aux,
                 "train/avg_ppl": ppl,
                 "train/tok_per_sec": tps,
             }, step=step)
             running_loss = 0.0
             running_lm_loss = 0.0
+            running_aux_loss = 0.0
             running_count = 0
 
         eval_due = (

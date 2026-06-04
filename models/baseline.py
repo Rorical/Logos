@@ -11,7 +11,17 @@ import torch.nn.functional as F
 
 
 def _maybe_all_reduce_load(load: torch.Tensor) -> torch.Tensor:
-    """Single-process hook kept to centralize expert-load accounting."""
+    """Centralized expert-load accounting for bias updates.
+
+    CUDA/CPU distributed runs use ``torch.distributed`` directly. XLA patches
+    this hook from ``scripts/train_xla.py`` because its collectives live outside
+    ``torch.distributed``.
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        load = load.clone()
+        torch.distributed.all_reduce(
+            load, op=torch.distributed.ReduceOp.SUM,
+        )
     return load
 
 
@@ -24,6 +34,19 @@ def _expert_load_from_topk(
         topk_indices.reshape(-1),
         minlength=num_experts,
     ).to(torch.float32)
+
+
+def combine_lm_and_aux_loss(
+    lm_loss: Optional[torch.Tensor],
+    aux_loss: Optional[torch.Tensor],
+    training: bool,
+) -> Optional[torch.Tensor]:
+    """Train on auxiliary regularization while reporting LM loss separately."""
+    if lm_loss is None:
+        return None
+    if training and aux_loss is not None:
+        return lm_loss + aux_loss
+    return lm_loss
 
 
 def _validate_moe_config(config) -> None:
@@ -44,8 +67,18 @@ def _validate_moe_config(config) -> None:
         raise ValueError("capacity_factor must be > 0 when use_moe=True")
     if getattr(config, "router_logit_noise_std", 0.0) < 0:
         raise ValueError("router_logit_noise_std must be >= 0 when use_moe=True")
+    if getattr(config, "router_logit_noise_decay_steps", 0) < 0:
+        raise ValueError("router_logit_noise_decay_steps must be >= 0 when use_moe=True")
     if getattr(config, "router_init_std", 0.0) <= 0:
         raise ValueError("router_init_std must be > 0 when use_moe=True")
+    if getattr(config, "router_bias_error_clip", 0.0) <= 0:
+        raise ValueError("router_bias_error_clip must be > 0 when use_moe=True")
+    if getattr(config, "router_bias_clip", 0.0) <= 0:
+        raise ValueError("router_bias_clip must be > 0 when use_moe=True")
+    if getattr(config, "moe_aux_loss_weight", 0.0) < 0:
+        raise ValueError("moe_aux_loss_weight must be >= 0 when use_moe=True")
+    if getattr(config, "moe_aux_loss_decay_steps", 0) < 0:
+        raise ValueError("moe_aux_loss_decay_steps must be >= 0 when use_moe=True")
 
 
 @dataclass
@@ -68,8 +101,13 @@ class BaselineConfig:
     expert_d_ff: int = 256
     bias_update_rate: float = 0.01
     capacity_factor: float = 2.0
-    router_logit_noise_std: float = 0.0
+    router_logit_noise_std: float = 0.1
+    router_logit_noise_decay_steps: int = 2000
     router_init_std: float = 0.002
+    router_bias_error_clip: float = 1.0
+    router_bias_clip: float = 1.0
+    moe_aux_loss_weight: float = 1e-3
+    moe_aux_loss_decay_steps: int = 2000
     # 0 keeps the standard full-logits CE. Positive values enable the
     # memory-efficient chunked LM-head CE in models that support it.
     lm_head_chunk_size: int = 0
@@ -232,8 +270,11 @@ class Router(nn.Module):
 
 
 class MoELayer(nn.Module):
-    """Shared experts + top-k sparse experts with DeepSeek-style aux-loss-free
-    bias balancing. Static-shape dispatch keeps it torch.compile-clean.
+    """Shared experts + top-k sparse experts with bounded bias balancing.
+
+    Static-shape dispatch keeps it torch.compile-clean. The router combines a
+    post-step bias controller with optional warmup-only selection noise and a
+    tiny differentiable importance/load regularizer.
 
     ``num_loops`` > 1 gives the bias buffer a row per loop iteration so the
     same weights can specialise differently when reused across loops.
@@ -263,6 +304,17 @@ class MoELayer(nn.Module):
         self.bias_update_rate = config.bias_update_rate
         self.capacity_factor = config.capacity_factor
         self.router_logit_noise_std = float(getattr(config, "router_logit_noise_std", 0.0))
+        self.router_logit_noise_decay_steps = int(
+            getattr(config, "router_logit_noise_decay_steps", 0)
+        )
+        self.router_bias_error_clip = float(
+            getattr(config, "router_bias_error_clip", 1.0)
+        )
+        self.router_bias_clip = float(getattr(config, "router_bias_clip", 1.0))
+        self.moe_aux_loss_weight = float(getattr(config, "moe_aux_loss_weight", 0.0))
+        self.moe_aux_loss_decay_steps = int(
+            getattr(config, "moe_aux_loss_decay_steps", 0)
+        )
         self.num_loops = num_loops
         self.diversity_factor = float(getattr(config, "moe_diversity_factor", 0.0))
 
@@ -272,6 +324,16 @@ class MoELayer(nn.Module):
             "bias",
             torch.zeros(num_loops, config.num_sparse_experts),
             persistent=True,
+        )
+        self.register_buffer(
+            "router_noise_scale",
+            torch.tensor(self.router_logit_noise_std, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "moe_aux_loss_scale",
+            torch.tensor(self.moe_aux_loss_weight, dtype=torch.float32),
+            persistent=False,
         )
 
         self.shared_experts = nn.ModuleList([
@@ -283,6 +345,74 @@ class MoELayer(nn.Module):
             config.d_model,
             config.expert_d_ff,
         )
+
+    @staticmethod
+    def _decayed_scale(base: float, decay_steps: int, step: int) -> float:
+        if base <= 0:
+            return 0.0
+        if decay_steps <= 0:
+            return base
+        progress = min(1.0, max(0.0, step / max(1, decay_steps)))
+        return base * (1.0 - progress)
+
+    def set_training_step(self, step: int) -> None:
+        """Update warmup-only router controls outside the compiled forward."""
+        self.router_noise_scale.fill_(
+            self._decayed_scale(
+                self.router_logit_noise_std,
+                self.router_logit_noise_decay_steps,
+                step,
+            )
+        )
+        self.moe_aux_loss_scale.fill_(
+            self._decayed_scale(
+                self.moe_aux_loss_weight,
+                self.moe_aux_loss_decay_steps,
+                step,
+            )
+        )
+
+    def _router_aux_loss(
+        self,
+        router_scores: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.training or self.moe_aux_loss_weight <= 0:
+            return router_scores.new_zeros(())
+
+        E = self.num_sparse_experts
+        scores = router_scores.float().reshape(-1, E)
+        importance = scores.mean(dim=0)
+        importance = importance / importance.sum().clamp_min(1e-9)
+        with torch.no_grad():
+            load = _expert_load_from_topk(topk_indices.detach(), E).to(
+                importance.device,
+            )
+            load = load / load.sum().clamp_min(1.0)
+
+        # Switch-style load/importance term gives router weights gradient even
+        # when hard top-k collapses while soft scores still look near-uniform.
+        switch = E * (load * importance).sum()
+        target = 1.0 / E
+        kl_uniform = (
+            importance
+            * (torch.log(importance.clamp_min(1e-9)) - math.log(target))
+        ).sum()
+        aux = switch + kl_uniform
+        scale = self.moe_aux_loss_scale.to(device=aux.device, dtype=aux.dtype)
+        return aux * scale
+
+    def _balance_update(self, load_fraction: torch.Tensor) -> torch.Tensor:
+        target = 1.0 / self.num_sparse_experts
+        update = (target - load_fraction) / target
+        return update.clamp(
+            -self.router_bias_error_clip,
+            self.router_bias_error_clip,
+        )
+
+    def _renormalize_bias(self) -> None:
+        self.bias.sub_(self.bias.mean(dim=1, keepdim=True))
+        self.bias.clamp_(-self.router_bias_clip, self.router_bias_clip)
 
     def forward(
         self,
@@ -318,9 +448,11 @@ class MoELayer(nn.Module):
         selection_scores = biased_scores
         if self.training and self.router_logit_noise_std > 0:
             selection_scores = selection_scores + (
-                torch.randn_like(selection_scores) * self.router_logit_noise_std
+                torch.randn_like(selection_scores)
+                * self.router_noise_scale.to(selection_scores.dtype)
             )
         _, topk_indices = torch.topk(selection_scores, K, dim=-1)
+        aux_loss = self._router_aux_loss(router_scores, topk_indices)
         # Gates from clean bounded scores at the selected experts.
         selected_scores = router_scores.gather(-1, topk_indices)
         topk_probs = selected_scores / selected_scores.sum(
@@ -397,9 +529,7 @@ class MoELayer(nn.Module):
         )
         sparse_out = sparse_out_ext[:N].view(batch, seq_len, d_model)
 
-        return shared_out + sparse_out, torch.tensor(
-            0.0, device=device, dtype=dtype
-        ), topk_indices
+        return shared_out + sparse_out, aux_loss, topk_indices
 
     def update_bias(self, topk_indices: torch.Tensor, loop_idx: int = 0) -> None:
         """Per-row balance update for one loop iteration. Call after
@@ -411,10 +541,10 @@ class MoELayer(nn.Module):
             load = _maybe_all_reduce_load(load)
             total = load.sum() + 1e-9
             load_fraction = load / total
-            target_fraction = 1.0 / self.num_sparse_experts
-            self.bias[loop_idx] += self.bias_update_rate * (
-                target_fraction - load_fraction
+            self.bias[loop_idx] += self.bias_update_rate * self._balance_update(
+                load_fraction,
             )
+            self._renormalize_bias()
 
     def update_bias_per_loop(
         self,
@@ -441,20 +571,29 @@ class MoELayer(nn.Module):
             loads = _maybe_all_reduce_load(loads)
             loads = loads / (loads.sum(dim=1, keepdim=True) + 1e-9)
 
-            target = 1.0 / self.num_sparse_experts
-
             if self.num_loops > 1 and self.diversity_factor > 0:
                 agg_load = loads.mean(dim=0)
-                agg_term = (target - agg_load).unsqueeze(0).expand_as(loads)
+                agg_term = self._balance_update(agg_load).unsqueeze(0).expand_as(loads)
                 other_mean = (loads.sum(dim=0, keepdim=True) - loads) / (
                     self.num_loops - 1
                 )
-                diversity_term = -self.diversity_factor * (other_mean - target)
+                target = 1.0 / self.num_sparse_experts
+                diversity_term = -self.diversity_factor * (
+                    (other_mean - target) / target
+                ).clamp(
+                    -self.router_bias_error_clip,
+                    self.router_bias_error_clip,
+                )
                 update = agg_term + diversity_term
             else:
-                update = target - loads
+                update = self._balance_update(loads)
 
+            update = update.clamp(
+                -self.router_bias_error_clip,
+                self.router_bias_error_clip,
+            )
             self.bias += self.bias_update_rate * update
+            self._renormalize_bias()
 
 
 def init_moe_router_weights(module: nn.Module, std: float) -> None:
@@ -467,6 +606,13 @@ def init_moe_router_weights(module: nn.Module, std: float) -> None:
     for child in module.modules():
         if isinstance(child, MoELayer):
             nn.init.normal_(child.router.linear.weight, mean=0.0, std=std)
+
+
+def set_moe_training_step(module: nn.Module, step: int) -> None:
+    """Apply step-scheduled MoE controls without mutating state in forward."""
+    for child in module.modules():
+        if isinstance(child, MoELayer):
+            child.set_training_step(step)
 
 
 def softmax_with_sink(scores: torch.Tensor, sink_logit: torch.Tensor) -> torch.Tensor:
@@ -686,7 +832,7 @@ class BaselineTransformer(nn.Module):
         x = self.final_norm(x)
         logits = self.lm_head(x)
 
-        loss: Optional[torch.Tensor] = None
+        lm_loss: Optional[torch.Tensor] = None
         if labels is not None:
             shift_logits = logits[..., :-1, :]
             shift_labels = labels[..., 1:]
@@ -697,11 +843,17 @@ class BaselineTransformer(nn.Module):
                 ignore_index=-100,
                 reduction="sum",
             )
-            loss = loss_sum / (flat_labels != -100).sum().clamp_min(1)
+            lm_loss = loss_sum / (flat_labels != -100).sum().clamp_min(1)
+        loss = combine_lm_and_aux_loss(
+            lm_loss,
+            aux_loss if self.config.use_moe else None,
+            self.training,
+        )
 
         return {
             "logits": logits,
             "loss": loss,
+            "lm_loss": lm_loss,
             "aux_loss": aux_loss if self.config.use_moe else None,
             "topk_indices": topk_indices_list if self.config.use_moe else None,
         }
