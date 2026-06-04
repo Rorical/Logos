@@ -22,6 +22,7 @@ from models.baseline import (
     RMSNorm,
     TransformerBlock,
     MoELayer,
+    init_moe_router_weights,
     count_parameters,
     model_summary,
 )
@@ -135,6 +136,7 @@ class RecursiveTransformer(nn.Module):
                     torch.nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        init_moe_router_weights(self, self.config.router_init_std)
 
     def forward(
         self,

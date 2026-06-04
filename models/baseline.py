@@ -44,6 +44,8 @@ def _validate_moe_config(config) -> None:
         raise ValueError("capacity_factor must be > 0 when use_moe=True")
     if getattr(config, "router_logit_noise_std", 0.0) < 0:
         raise ValueError("router_logit_noise_std must be >= 0 when use_moe=True")
+    if getattr(config, "router_init_std", 0.0) <= 0:
+        raise ValueError("router_init_std must be > 0 when use_moe=True")
 
 
 @dataclass
@@ -67,6 +69,7 @@ class BaselineConfig:
     bias_update_rate: float = 0.01
     capacity_factor: float = 2.0
     router_logit_noise_std: float = 0.0
+    router_init_std: float = 0.002
     # 0 keeps the standard full-logits CE. Positive values enable the
     # memory-efficient chunked LM-head CE in models that support it.
     lm_head_chunk_size: int = 0
@@ -454,6 +457,18 @@ class MoELayer(nn.Module):
             self.bias += self.bias_update_rate * update
 
 
+def init_moe_router_weights(module: nn.Module, std: float) -> None:
+    """Initialize MoE routers after generic Linear initialization.
+
+    Router projections should start much smaller than content projections:
+    otherwise early low-diversity hidden states can make one random top-k
+    expert set win globally before the bias balancer has enough authority.
+    """
+    for child in module.modules():
+        if isinstance(child, MoELayer):
+            nn.init.normal_(child.router.linear.weight, mean=0.0, std=std)
+
+
 def softmax_with_sink(scores: torch.Tensor, sink_logit: torch.Tensor) -> torch.Tensor:
     """Softmax with a per-head learnable sink logit appended to the
     denominator; weights sum to <= 1 (StreamingLLM / GPT-OSS-style)."""
@@ -650,6 +665,7 @@ class BaselineTransformer(nn.Module):
                     torch.nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        init_moe_router_weights(self, self.config.router_init_std)
 
     def forward(
         self,

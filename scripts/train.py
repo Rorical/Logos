@@ -776,6 +776,7 @@ def build_model(args: argparse.Namespace, vocab_size: int):
         expert_d_ff=args.expert_d_ff,
         bias_update_rate=args.bias_update_rate,
         router_logit_noise_std=args.router_logit_noise_std,
+        router_init_std=args.router_init_std,
         moe_diversity_factor=args.moe_diversity_factor,
         lm_head_chunk_size=args.lm_head_chunk_size,
         block_residual_isolate_softmax=args.block_residual_isolate_softmax,
@@ -1932,6 +1933,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "early hidden states are low-diversity. Gate "
                              "weights still use clean bounded scores, and "
                              "eval/inference routing is unchanged.")
+    parser.add_argument("--router-init-std", type=float, default=0.002,
+                        help="Initialization std for MoE Router.linear.weight. "
+                             "Routers start smaller than content projections "
+                             "so early low-diversity hidden states do not "
+                             "lock every token into the same random top-k "
+                             "expert set before bias balancing catches up.")
     parser.add_argument("--block-residual-isolate-softmax", action="store_true",
                         help="Route the BlockAttentionResidual depth-softmax "
                              "+ weighted-sum through an opaque "
