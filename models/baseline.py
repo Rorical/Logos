@@ -488,17 +488,26 @@ class MoELayer(nn.Module):
             valid, slot_indices, torch.full_like(slot_indices, C)
         )
 
-        expert_in = torch.zeros(E, C + 1, d_model, device=device, dtype=dtype)
-        expert_gate = torch.zeros(E, C + 1, device=device, dtype=dtype)
-        expert_tok = torch.full(
-            (E, C + 1), -1, dtype=torch.long, device=device
-        )
-        expert_mask = torch.zeros(E, C + 1, dtype=torch.bool, device=device)
+        flat_slot = sorted_expert_ids * (C + 1) + safe_slot
+        flat_size = E * (C + 1)
+        valid_f = valid.to(dtype)
+        invalid_tok = torch.full_like(sorted_token_ids, N)
+        safe_token_ids = torch.where(valid, sorted_token_ids, invalid_tok)
 
-        expert_in[sorted_expert_ids, safe_slot] = sorted_x
-        expert_gate[sorted_expert_ids, safe_slot] = sorted_gates
-        expert_tok[sorted_expert_ids, safe_slot] = sorted_token_ids
-        expert_mask[sorted_expert_ids, safe_slot] = valid
+        expert_in = torch.zeros(flat_size, d_model, device=device, dtype=dtype)
+        expert_gate = torch.zeros(flat_size, device=device, dtype=dtype)
+        expert_tok = torch.full((flat_size,), N, dtype=torch.long, device=device)
+        expert_mask_i32 = torch.zeros(flat_size, dtype=torch.int32, device=device)
+
+        expert_in = expert_in.index_add(0, flat_slot, sorted_x * valid_f.unsqueeze(-1))
+        expert_gate = expert_gate.index_add(0, flat_slot, sorted_gates * valid_f)
+        expert_tok = expert_tok.scatter(0, flat_slot, safe_token_ids)
+        expert_mask_i32 = expert_mask_i32.scatter(0, flat_slot, valid.to(torch.int32))
+
+        expert_in = expert_in.view(E, C + 1, d_model)
+        expert_gate = expert_gate.view(E, C + 1)
+        expert_tok = expert_tok.view(E, C + 1)
+        expert_mask = expert_mask_i32.view(E, C + 1).bool()
 
         expert_in = expert_in[:, :C].contiguous()
         expert_gate = expert_gate[:, :C].contiguous()
@@ -523,8 +532,7 @@ class MoELayer(nn.Module):
 
         sparse_out_ext = torch.zeros(
             N + 1, d_model, device=device, dtype=dtype
-        )
-        sparse_out_ext.index_add_(
+        ).index_add(
             0, safe_dst, safe_gate.unsqueeze(-1) * flat_src
         )
         sparse_out = sparse_out_ext[:N].view(batch, seq_len, d_model)
