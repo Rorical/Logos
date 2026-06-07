@@ -467,7 +467,7 @@ class MoELayer(nn.Module):
 
         sorted_expert_ids, sort_idx = torch.sort(topk_indices_flat)
         sorted_token_ids = token_ids[sort_idx]
-        sorted_gates = topk_probs_flat[sort_idx]
+        sorted_gates = topk_probs_flat[sort_idx].to(dtype=dtype)
 
         # Per-expert slot index via cummax over (position * is_first);
         # avoids the dynamic-shape ``nonzero`` that would graph-break
