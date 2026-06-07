@@ -466,6 +466,7 @@ def run_step_training_xla(
     sample_text_fn,
     total_steps: int,
     start_step: int = 0,
+    phase1_train_loader: Optional[DataLoader] = None,
 ) -> Dict[str, Any]:
     grad_clip = args.grad_clip
     log_every = max(1, args.log_every)
@@ -476,9 +477,18 @@ def run_step_training_xla(
         print("\n" + "=" * 60)
         resume_note = f" | resuming at step {start_step}" if start_step else ""
         print(
-            f"XLA streaming training: {total_steps} steps | "
+            f"XLA step training: {total_steps} steps | "
             f"world_size={world_size}" + resume_note
         )
+        phase1_steps = base.token_superposition_phase1_steps(args, total_steps)
+        if phase1_steps:
+            print(
+                "Token Superposition Training: "
+                f"phase 1 steps 0-{phase1_steps - 1} "
+                f"(bag_size={args.token_superposition_bag_size}), "
+                f"phase 2 steps {phase1_steps}-{total_steps - 1} "
+                "(standard NTP)"
+            )
         print("=" * 60)
 
     history: list = []
@@ -492,22 +502,39 @@ def run_step_training_xla(
     pbar = tqdm(total=total_steps, initial=start_step, desc="train", disable=not main)
 
     model.train(True)
-    device_loader = pl.MpDeviceLoader(
-        train_loader,
-        device,
-        batches_per_execution=max(1, int(args.xla_batches_per_execution)),
-    )
-    train_iter = iter(device_loader)
+    phase1_steps = base.token_superposition_phase1_steps(args, total_steps)
+    if phase1_steps > 0 and phase1_train_loader is None:
+        raise ValueError("phase1_train_loader is required when TST is enabled")
+    train_loaders: Dict[int, DataLoader] = {1: train_loader}
+    if phase1_steps > 0 and phase1_train_loader is not None:
+        train_loaders[int(args.token_superposition_bag_size)] = phase1_train_loader
+    device_loaders: Dict[int, Any] = {}
+    train_iters: Dict[int, Any] = {}
     while step < total_steps:
+        bag_size = base.token_superposition_bag_size_for_step(args, step, total_steps)
+        device_loader = device_loaders.get(bag_size)
+        if device_loader is None:
+            device_loader = pl.MpDeviceLoader(
+                train_loaders[bag_size],
+                device,
+                batches_per_execution=max(1, int(args.xla_batches_per_execution)),
+            )
+            device_loaders[bag_size] = device_loader
+        train_iter = train_iters.get(bag_size)
+        if train_iter is None:
+            train_iter = iter(device_loader)
+            train_iters[bag_size] = train_iter
         try:
             batch = next(train_iter)
         except StopIteration:
             device_loader = pl.MpDeviceLoader(
-                train_loader,
+                train_loaders[bag_size],
                 device,
                 batches_per_execution=max(1, int(args.xla_batches_per_execution)),
             )
+            device_loaders[bag_size] = device_loader
             train_iter = iter(device_loader)
+            train_iters[bag_size] = train_iter
             batch = next(train_iter)
 
         ids = batch["input_ids"]
@@ -515,7 +542,13 @@ def run_step_training_xla(
         optimizer.zero_grad(set_to_none=True)
         base.set_moe_training_step(raw_model, step)
         with _xla_autocast(use_amp, mp_dtype):
-            outputs = model(input_ids=ids, attention_mask=None, labels=lbls, is_causal=True)
+            outputs = model(
+                input_ids=ids,
+                attention_mask=None,
+                labels=lbls,
+                is_causal=True,
+                token_superposition_bag_size=bag_size,
+            )
         loss = outputs["loss"]
         loss.backward()
         grad_norm = _optimizer_step_xla(xm, model, optimizer, grad_clip)
@@ -550,13 +583,17 @@ def run_step_training_xla(
             pbar.update(1)
 
         if main:
-            tokens_seen = step * args.batch_size * args.max_length * world_size
+            tokens_seen = base.token_superposition_tokens_seen(
+                args, step, total_steps, world_size,
+            )
             metrics = {
                 "train/loss": loss_val,
                 "train/lm_loss": lm_loss_val,
                 "train/aux_loss": aux_loss_val,
                 "train/ppl": math.exp(min(lm_loss_val, 20)),
                 "train/tokens_seen": tokens_seen,
+                "train/tst_bag_size": bag_size,
+                "train/tst_phase": 1 if bag_size > 1 else 2,
             }
             for i, pg in enumerate(optimizer.param_groups):
                 tag = pg.get("name") or f"g{i}"
@@ -575,16 +612,25 @@ def run_step_training_xla(
             avg_aux = running_aux_loss / running_count
             ppl = math.exp(min(avg_lm, 20))
             elapsed = time.time() - t0
-            steps_this_run = step - start_step
-            tps = (steps_this_run * args.batch_size * args.max_length * world_size) / max(elapsed, 1)
-            pbar.set_postfix({
+            tokens_this_run = (
+                base.token_superposition_tokens_seen(args, step, total_steps, world_size)
+                - base.token_superposition_tokens_seen(
+                    args, start_step, total_steps, world_size,
+                )
+            )
+            tps = tokens_this_run / max(elapsed, 1)
+            postfix = {
                 "loss": f"{avg:.3f}",
                 "lm": f"{avg_lm:.3f}",
                 "aux": f"{avg_aux:.1e}",
                 "ppl": f"{ppl:.1f}",
                 "lr": f"{optimizer.param_groups[0]['lr']:.1e}",
                 "tok/s": f"{tps:.0f}",
-            })
+            }
+            if phase1_steps:
+                postfix["phase"] = "tst" if bag_size > 1 else "ntp"
+                postfix["bag"] = str(bag_size)
+            pbar.set_postfix(postfix)
             base.wandb_log({
                 "train/avg_loss": avg,
                 "train/avg_lm_loss": avg_lm,
@@ -719,7 +765,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _load_finite_dataset_xla(args, tokenizer, xm, rank: int, world_size: int):
     main_proc = _xla_is_main(xm)
 
-    def _load_and_preprocess():
+    def _load_dataset_raw():
         if main_proc:
             print(f"Loading dataset: "
                   f"{base._describe_dataset_source(args.dataset, args.dataset_config)}")
@@ -748,22 +794,46 @@ def _load_finite_dataset_xla(args, tokenizer, xm, rank: int, world_size: int):
             ds["validation"] = ds["validation"].select(range(n))
             if main_proc:
                 print(f"  Subset validation to {n} examples")
-        if main_proc:
-            print(f"Preprocessing with block_size={args.max_length} ...")
-        return base.preprocess_dataset(
-            ds, tokenizer, args.max_length, text_column=args.text_column,
-        )
+        return ds
 
     if main_proc:
-        dataset = _load_and_preprocess()
+        raw_dataset = _load_dataset_raw()
     _xla_barrier(xm, "dataset-preprocess-main")
     if not main_proc:
-        dataset = _load_and_preprocess()
+        raw_dataset = _load_dataset_raw()
     _xla_barrier(xm, "dataset-preprocess-all")
+
+    if main_proc:
+        print(f"Preprocessing with block_size={args.max_length} ...")
+    dataset = base.preprocess_dataset(
+        raw_dataset, tokenizer, args.max_length, text_column=args.text_column,
+    )
+
+    phase1_dataset = None
+    if base.token_superposition_enabled(args):
+        phase1_block_size = base.token_superposition_phase1_block_size(args)
+        if main_proc:
+            print(
+                "Preprocessing TST phase-1 train split with "
+                f"block_size={phase1_block_size} ..."
+            )
+        phase1_dataset = base.preprocess_dataset(
+            DatasetDict({"train": raw_dataset["train"]}),
+            tokenizer,
+            phase1_block_size,
+            text_column=args.text_column,
+        )
 
     if main_proc:
         print(f"  train examples:      {len(dataset['train'])}")
         print(f"  validation examples: {len(dataset['validation'])}")
+        if phase1_dataset is not None:
+            print(f"  TST phase-1 examples: {len(phase1_dataset['train'])}")
+    if phase1_dataset is not None and len(phase1_dataset["train"]) == 0:
+        raise ValueError(
+            "TST phase-1 preprocessing produced zero train examples; "
+            "reduce --max-length or --tst-bag-size, or use more data."
+        )
 
     train_loader = base.create_dataloader(
         dataset["train"], args.batch_size, shuffle=True,
@@ -778,7 +848,15 @@ def _load_finite_dataset_xla(args, tokenizer, xm, rank: int, world_size: int):
         seed=args.seed,
         drop_last=(world_size > 1),
     )
-    return train_loader, val_loader
+    phase1_train_loader = None
+    if phase1_dataset is not None:
+        phase1_train_loader = base.create_dataloader(
+            phase1_dataset["train"], args.batch_size, shuffle=True,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            seed=args.seed,
+        )
+    return train_loader, val_loader, phase1_train_loader
 
 
 def _build_streaming_loaders_xla(args, tokenizer, xm, rank: int, world_size: int):
@@ -823,7 +901,25 @@ def _build_streaming_loaders_xla(args, tokenizer, xm, rank: int, world_size: int
         common_kw["prefetch_factor"] = max(1, int(args.prefetch_factor))
     train_loader = DataLoader(train_ds, **common_kw)
     val_loader = DataLoader(val_ds, drop_last=False, **common_kw)
-    return train_loader, val_loader
+    phase1_train_loader = None
+    if base.token_superposition_enabled(args):
+        phase1_block_size = base.token_superposition_phase1_block_size(args)
+        if _xla_is_main(xm):
+            print(
+                "Building TST phase-1 streaming train loader with "
+                f"block_size={phase1_block_size}"
+            )
+        train_stream_phase1 = load_dataset(**load_kwargs).skip(args.val_docs)
+        if world_size > 1:
+            train_stream_phase1 = train_stream_phase1.shard(
+                num_shards=world_size, index=rank,
+            )
+        phase1_ds = base.PackedStream(
+            train_stream_phase1, tokenizer, phase1_block_size,
+            text_key=args.text_column,
+        )
+        phase1_train_loader = DataLoader(phase1_ds, **common_kw)
+    return train_loader, val_loader, phase1_train_loader
 
 
 def _broadcast_master_params(xm, model: nn.Module, disabled: bool, main_proc: bool) -> None:
@@ -884,23 +980,34 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
             raise ValueError("--total-steps and --total-tokens are mutually exclusive")
         if args.total_tokens is not None:
             tokens_per_step = world_size * args.batch_size * args.max_length
-            args.total_steps = max(1, math.ceil(args.total_tokens / tokens_per_step))
+            args.total_steps = base.derive_steps_from_token_budget(
+                args, args.total_tokens, world_size,
+            )
             if main_proc:
-                actual_tokens = args.total_steps * tokens_per_step
+                actual_tokens = base.token_superposition_tokens_seen(
+                    args, args.total_steps, args.total_steps, world_size,
+                )
+                phase_note = ""
+                if base.token_superposition_enabled(args):
+                    phase_note = (
+                        f", phase1 bag_size={args.token_superposition_bag_size}, "
+                        f"ratio={args.token_superposition_ratio:g}"
+                    )
                 print(
                     f"  Token budget: --total-tokens={args.total_tokens:,} "
                     f"-> total_steps={args.total_steps:,} "
-                    f"({tokens_per_step:,} tokens/step, actual={actual_tokens:,})"
+                    f"({tokens_per_step:,} standard tokens/step{phase_note}, "
+                    f"actual={actual_tokens:,})"
                 )
         if args.total_steps is None or args.total_steps <= 0:
             raise ValueError(
                 "--streaming requires --total-steps N (N > 0) or --total-tokens"
             )
-        train_loader, val_loader = _build_streaming_loaders_xla(
+        train_loader, val_loader, phase1_train_loader = _build_streaming_loaders_xla(
             args, tokenizer, xm, rank=rank, world_size=world_size,
         )
     else:
-        train_loader, val_loader = _load_finite_dataset_xla(
+        train_loader, val_loader, phase1_train_loader = _load_finite_dataset_xla(
             args, tokenizer, xm, rank=rank, world_size=world_size,
         )
 
@@ -911,6 +1018,13 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
         print(f"\nModel: {type(model).__name__}")
         print(f"  parameters: {base.count_parameters(model):,}")
         print(f"  use_moe:    {config.use_moe}")
+        if base.token_superposition_enabled(args):
+            print(
+                "  TST:        "
+                f"bag_size={args.token_superposition_bag_size}, "
+                f"ratio={args.token_superposition_ratio:g}, "
+                f"phase1_block={base.token_superposition_phase1_block_size(args)}"
+            )
         if config.use_moe:
             print(f"  shared experts: {config.num_shared_experts}")
             print(f"  sparse experts: {config.num_sparse_experts}")
@@ -921,6 +1035,8 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
         args.total_steps if args.streaming
         else len(train_loader) * args.epochs
     )
+    if base.token_superposition_enabled(args) and not args.streaming:
+        args.total_steps = total_steps
     muon_params, embed_params, default_params, router_params = base.split_param_groups(model)
     optimizer, scheduler, muon_hp = base.build_optimizer_and_scheduler(
         args, total_steps, fused_adamw,
@@ -995,11 +1111,26 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
         xm.mark_step()
         return tokenizer.decode(generated[0].cpu())
 
-    if args.streaming:
+    if args.streaming or base.token_superposition_enabled(args):
+        if base.token_superposition_enabled(args) and not args.streaming:
+            steps_per_epoch = max(1, len(train_loader))
+            if main_proc:
+                print(
+                    "  TST uses step-based training; converting finite-mode "
+                    f"eval/save/sample intervals by {steps_per_epoch} "
+                    "steps per epoch."
+                )
+            if args.eval_every > 0:
+                args.eval_every *= steps_per_epoch
+            if args.save_every > 0:
+                args.save_every *= steps_per_epoch
+            if args.sample_every > 0:
+                args.sample_every *= steps_per_epoch
         result = run_step_training_xla(
             xm, pl, args, model, raw_model, optimizer, scheduler, muon_hp,
             ema_model, train_loader, val_loader, device, use_amp, mp_dtype,
             save_dir, sample_text, total_steps, start_step=start_step,
+            phase1_train_loader=phase1_train_loader,
         )
         history = result["history"]
         best_val_loss = result["best_val_loss"]
@@ -1013,6 +1144,13 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
                 "best_val_loss": best_val_loss,
                 "history": history,
             }
+            if base.token_superposition_enabled(args):
+                history_payload["token_superposition"] = {
+                    "bag_size": args.token_superposition_bag_size,
+                    "ratio": args.token_superposition_ratio,
+                    "phase1_steps": base.token_superposition_phase1_steps(args, total_steps),
+                    "phase1_block_size": base.token_superposition_phase1_block_size(args),
+                }
             if wandb_run is not None:
                 history_payload["wandb"] = {
                     "run_id": wandb_run.id,
@@ -1211,6 +1349,7 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
 def main(args: Optional[argparse.Namespace] = None):
     if args is None:
         args = build_arg_parser().parse_args()
+    base.validate_token_superposition_args(args)
     os.environ.setdefault("PJRT_DEVICE", "TPU")
     torch_xla, _, _ = _import_xla()
 

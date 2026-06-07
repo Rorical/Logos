@@ -8,6 +8,48 @@ import torch
 import torch.nn.functional as F
 
 
+def token_superposition_embeddings(
+    token_emb,
+    input_ids: torch.Tensor,
+    bag_size: int,
+) -> torch.Tensor:
+    """Average contiguous token embeddings into training-time bags.
+
+    This is the input-side fold from Token Superposition Training. A raw
+    sequence of length ``L = l * s`` becomes ``l`` latent positions, each the
+    mean embedding of ``s`` contiguous source tokens.
+    """
+    bag_size = int(bag_size)
+    x = token_emb(input_ids)
+    if bag_size <= 1:
+        return x
+    if input_ids.size(1) % bag_size != 0:
+        raise ValueError(
+            "token superposition requires sequence length divisible by "
+            f"bag_size; got seq_len={input_ids.size(1)}, bag_size={bag_size}"
+        )
+    batch, seq_len, d_model = x.shape
+    return x.reshape(batch, seq_len // bag_size, bag_size, d_model).mean(dim=2)
+
+
+def token_superposition_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+    bag_size: int,
+) -> Optional[torch.Tensor]:
+    if attention_mask is None or int(bag_size) <= 1:
+        return attention_mask
+    bag_size = int(bag_size)
+    if attention_mask.size(1) % bag_size != 0:
+        raise ValueError(
+            "token superposition requires attention_mask length divisible by "
+            f"bag_size; got seq_len={attention_mask.size(1)}, "
+            f"bag_size={bag_size}"
+        )
+    batch, seq_len = attention_mask.shape
+    folded = attention_mask.reshape(batch, seq_len // bag_size, bag_size)
+    return folded.any(dim=2).to(attention_mask.dtype)
+
+
 def _autocast_state(device_type: str) -> Tuple[bool, torch.dtype | None]:
     try:
         enabled = torch.is_autocast_enabled(device_type)
@@ -282,3 +324,73 @@ def standard_lm_cross_entropy(
     )
     count = (flat_labels != ignore_index).sum().clamp_min(1)
     return loss_sum / count
+
+
+def token_superposition_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    bag_size: int,
+    *,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Mean CE over the next bag of ``bag_size`` targets per latent step.
+
+    ``logits[:, k]`` predicts every token in source bag ``k + 1``. The loss is
+    equivalent to a multi-hot target distribution with probability mass
+    ``1 / bag_size`` assigned to each token in that next bag, implemented as a
+    sum of ordinary cross-entropies so existing CE kernels are reused.
+    """
+    bag_size = int(bag_size)
+    if bag_size <= 1:
+        return standard_lm_cross_entropy(
+            logits, labels, ignore_index=ignore_index,
+        )
+    if labels.size(1) % bag_size != 0:
+        raise ValueError(
+            "token superposition requires label length divisible by bag_size; "
+            f"got seq_len={labels.size(1)}, bag_size={bag_size}"
+        )
+    latent_len = labels.size(1) // bag_size
+    if logits.size(1) != latent_len:
+        raise ValueError(
+            "token superposition logits/labels length mismatch; "
+            f"got logits_len={logits.size(1)}, label_bags={latent_len}"
+        )
+    if latent_len < 2:
+        return logits.new_zeros((), dtype=torch.float32)
+
+    target_bags = labels.reshape(labels.size(0), latent_len, bag_size)[:, 1:, :]
+    flat_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
+
+    loss_sum = None
+    count = torch.zeros((), device=labels.device, dtype=torch.long)
+    for offset in range(bag_size):
+        flat_targets = target_bags[:, :, offset].reshape(-1)
+        part = F.cross_entropy(
+            flat_logits,
+            flat_targets,
+            ignore_index=ignore_index,
+            reduction="sum",
+        )
+        loss_sum = part if loss_sum is None else loss_sum + part
+        count = count + (flat_targets != ignore_index).sum()
+
+    assert loss_sum is not None
+    return loss_sum / count.clamp_min(1)
+
+
+def lm_cross_entropy_from_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    token_superposition_bag_size: int = 1,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    if int(token_superposition_bag_size) > 1:
+        return token_superposition_cross_entropy(
+            logits,
+            labels,
+            int(token_superposition_bag_size),
+            ignore_index=ignore_index,
+        )
+    return standard_lm_cross_entropy(logits, labels, ignore_index=ignore_index)

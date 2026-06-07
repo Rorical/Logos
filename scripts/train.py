@@ -73,6 +73,90 @@ def parse_token_count(value: str) -> int:
     return int(n)
 
 
+def token_superposition_enabled(args: argparse.Namespace) -> bool:
+    return int(getattr(args, "token_superposition_bag_size", 1) or 1) > 1
+
+
+def validate_token_superposition_args(args: argparse.Namespace) -> None:
+    bag_size = int(getattr(args, "token_superposition_bag_size", 1) or 1)
+    ratio = float(getattr(args, "token_superposition_ratio", 0.3) or 0.0)
+    if bag_size < 1:
+        raise ValueError("--tst-bag-size must be >= 1")
+    if not (0.0 <= ratio < 1.0):
+        raise ValueError("--tst-ratio must be in [0, 1)")
+    if bag_size > 1:
+        if ratio <= 0.0:
+            raise ValueError("--tst-ratio must be > 0 when --tst-bag-size > 1")
+        if args.max_length < 2:
+            raise ValueError("--max-length must be >= 2 for token superposition")
+
+
+def token_superposition_phase1_steps(
+    args: argparse.Namespace,
+    total_steps: int,
+) -> int:
+    if not token_superposition_enabled(args):
+        return 0
+    if total_steps < 2:
+        raise ValueError(
+            "token superposition requires at least 2 total steps so phase 2 "
+            "can recover standard next-token prediction"
+        )
+    ratio = float(args.token_superposition_ratio)
+    return max(1, min(total_steps - 1, int(total_steps * ratio)))
+
+
+def token_superposition_bag_size_for_step(
+    args: argparse.Namespace,
+    step: int,
+    total_steps: int,
+) -> int:
+    if step < token_superposition_phase1_steps(args, total_steps):
+        return int(args.token_superposition_bag_size)
+    return 1
+
+
+def token_superposition_phase1_block_size(args: argparse.Namespace) -> int:
+    return int(args.max_length) * int(args.token_superposition_bag_size)
+
+
+def token_superposition_tokens_seen(
+    args: argparse.Namespace,
+    steps_done: int,
+    total_steps: int,
+    world_size: int = 1,
+) -> int:
+    phase1_steps = token_superposition_phase1_steps(args, total_steps)
+    phase1_done = min(max(0, steps_done), phase1_steps)
+    phase2_done = max(0, steps_done - phase1_done)
+    raw_positions = (
+        phase1_done * int(args.max_length) * int(args.token_superposition_bag_size)
+        + phase2_done * int(args.max_length)
+    )
+    return int(world_size) * int(args.batch_size) * raw_positions
+
+
+def derive_steps_from_token_budget(
+    args: argparse.Namespace,
+    total_tokens: int,
+    world_size: int = 1,
+) -> int:
+    tokens_per_standard_step = int(world_size) * int(args.batch_size) * int(args.max_length)
+    if not token_superposition_enabled(args):
+        return max(1, math.ceil(total_tokens / tokens_per_standard_step))
+
+    lo, hi = 1, max(2, math.ceil(total_tokens / tokens_per_standard_step))
+    while token_superposition_tokens_seen(args, hi, hi, world_size) < total_tokens:
+        hi *= 2
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if token_superposition_tokens_seen(args, mid, mid, world_size) >= total_tokens:
+            hi = mid
+        else:
+            lo = mid + 1
+    return max(2, lo)
+
+
 def is_main_process() -> bool:
     return True
 
@@ -1509,6 +1593,35 @@ def build_streaming_loaders(
     return train_loader, val_loader
 
 
+def build_streaming_train_loader(
+    args: argparse.Namespace,
+    tokenizer,
+    block_size: int,
+) -> DataLoader:
+    load_kwargs = _dataset_load_kwargs(
+        args.dataset, args.dataset_config,
+        streaming=True, split="train",
+    )
+    train_stream = load_dataset(**load_kwargs).skip(args.val_docs)
+    train_ds = PackedStream(train_stream, tokenizer, block_size,
+                            text_key=args.text_column)
+
+    def collate(batch):
+        return {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
+
+    nw = max(0, int(args.num_workers))
+    loader_kwargs: Dict[str, Any] = dict(
+        batch_size=args.batch_size,
+        collate_fn=collate,
+        num_workers=nw,
+        pin_memory=torch.cuda.is_available(),
+    )
+    if nw > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+    return DataLoader(train_ds, **loader_kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Step-based training driver (used by the streaming path)
 # ---------------------------------------------------------------------------
@@ -1583,6 +1696,7 @@ def run_step_training(
     start_step: int = 0,
     diagnostic_monitor: Optional[Any] = None,
     model_config: Any = None,
+    phase1_train_loader: Optional[DataLoader] = None,
 ) -> Dict[str, Any]:
     """Step-bounded training. Mirrors the per-epoch path's per-step body
     (forward, backward, opt/sched/muon_hp, MoE bias update, EMA update)
@@ -1599,7 +1713,16 @@ def run_step_training(
     if main:
         print("\n" + "=" * 60)
         resume_note = f" | resuming at step {start_step}" if start_step else ""
-        print(f"Streaming training: {total_steps} steps" + resume_note)
+        print(f"Step training: {total_steps} steps" + resume_note)
+        phase1_steps = token_superposition_phase1_steps(args, total_steps)
+        if phase1_steps:
+            print(
+                "Token Superposition Training: "
+                f"phase 1 steps 0-{phase1_steps - 1} "
+                f"(bag_size={args.token_superposition_bag_size}), "
+                f"phase 2 steps {phase1_steps}-{total_steps - 1} "
+                "(standard NTP)"
+            )
         print("=" * 60)
 
     history: list = []
@@ -1629,14 +1752,27 @@ def run_step_training(
     cudagraph_mark = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
 
     model.train(True)
-    train_iter = iter(train_loader)
+    phase1_steps = token_superposition_phase1_steps(args, total_steps)
+    if phase1_steps > 0 and phase1_train_loader is None:
+        raise ValueError("phase1_train_loader is required when TST is enabled")
+    train_iters: Dict[int, Any] = {}
+    train_loaders: Dict[int, DataLoader] = {1: train_loader}
+    if phase1_steps > 0 and phase1_train_loader is not None:
+        train_loaders[int(args.token_superposition_bag_size)] = phase1_train_loader
     while step < total_steps:
         if cudagraph_mark is not None:
             cudagraph_mark()
+        bag_size = token_superposition_bag_size_for_step(args, step, total_steps)
+        active_loader = train_loaders[bag_size]
+        train_iter = train_iters.get(bag_size)
+        if train_iter is None:
+            train_iter = iter(active_loader)
+            train_iters[bag_size] = train_iter
         try:
             batch = next(train_iter)
         except StopIteration:
-            train_iter = iter(train_loader)
+            train_iter = iter(active_loader)
+            train_iters[bag_size] = train_iter
             batch = next(train_iter)
 
         ids = batch["input_ids"].to(device, non_blocking=True)
@@ -1645,7 +1781,13 @@ def run_step_training(
         optimizer.zero_grad(set_to_none=True)
         set_moe_training_step(raw_model, step)
         with torch.autocast(device_type=device.type, dtype=mp_dtype, enabled=use_amp):
-            outputs = model(input_ids=ids, attention_mask=None, labels=lbls, is_causal=True)
+            outputs = model(
+                input_ids=ids,
+                attention_mask=None,
+                labels=lbls,
+                is_causal=True,
+                token_superposition_bag_size=bag_size,
+            )
         loss = outputs["loss"]
         lm_loss_t = outputs.get("lm_loss")
         lm_loss = lm_loss_t if lm_loss_t is not None else loss
@@ -1759,13 +1901,15 @@ def run_step_training(
         # the muon_hp ramp is active, grad norm, and the running token
         # count so plots can be x-axis'd by tokens instead of steps.
         if main:
-            tokens_seen = step * args.batch_size * args.max_length
+            tokens_seen = token_superposition_tokens_seen(args, step, total_steps)
             metrics = {
                 "train/loss": loss_val,
                 "train/lm_loss": lm_loss_val,
                 "train/aux_loss": aux_loss_val,
                 "train/ppl": math.exp(min(lm_loss_val, 20)),
                 "train/tokens_seen": tokens_seen,
+                "train/tst_bag_size": bag_size,
+                "train/tst_phase": 1 if bag_size > 1 else 2,
             }
             for i, pg in enumerate(optimizer.param_groups):
                 tag = pg.get("name") or f"g{i}"
@@ -1794,8 +1938,11 @@ def run_step_training(
             running_avg = avg_lm  # save LM loss for diagnostics/plateau checks
             elapsed = time.time() - t0
             # Tokens/sec for the current run, counting only post-resume steps.
-            steps_this_run = step - start_step
-            tps = (steps_this_run * args.batch_size * args.max_length) / max(elapsed, 1)
+            tokens_this_run = (
+                token_superposition_tokens_seen(args, step, total_steps)
+                - token_superposition_tokens_seen(args, start_step, total_steps)
+            )
+            tps = tokens_this_run / max(elapsed, 1)
             postfix = {
                 "loss": f"{avg:.3f}",
                 "lm": f"{avg_lm:.3f}",
@@ -1804,6 +1951,9 @@ def run_step_training(
                 "lr": f"{optimizer.param_groups[0]['lr']:.1e}",
                 "tok/s": f"{tps:.0f}",
             }
+            if phase1_steps:
+                postfix["phase"] = "tst" if bag_size > 1 else "ntp"
+                postfix["bag"] = str(bag_size)
             # Approximate max expert-load fraction across all MoE
             # layers; cheap enough to update on every tqdm refresh and
             # gives early warning of router collapse without waiting for
@@ -2001,6 +2151,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-column", type=str, default="text")
     parser.add_argument("--max-length", type=int, default=512,
                         help="Sequence block size")
+    parser.add_argument(
+        "--tst-bag-size", "--token-superposition-bag-size",
+        dest="token_superposition_bag_size",
+        type=int,
+        default=1,
+        help="Token Superposition Training bag size. 1 disables TST. "
+             "When >1, phase 1 reads max_length * bag_size raw tokens, "
+             "averages each contiguous bag into one latent position, and "
+             "predicts the next bag with mean cross entropy.",
+    )
+    parser.add_argument(
+        "--tst-ratio", "--token-superposition-ratio",
+        dest="token_superposition_ratio",
+        type=float,
+        default=0.3,
+        help="Fraction of optimizer steps to spend in TST phase 1 before "
+             "switching back to standard next-token phase 2. Nous reports "
+             "0.2-0.4 as the useful range; default is 0.3.",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader worker processes. Use 0 to "
@@ -2380,6 +2549,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(args: Optional[argparse.Namespace] = None):
     if args is None:
         args = build_arg_parser().parse_args()
+    validate_token_superposition_args(args)
 
     main_proc = is_main_process()
 
@@ -2420,6 +2590,7 @@ def main(args: Optional[argparse.Namespace] = None):
     if main_proc:
         print(f"  vocab_size: {tokenizer.vocab_size}")
 
+    phase1_train_loader = None
     if args.streaming:
         if args.total_steps is not None and args.total_tokens is not None:
             raise ValueError(
@@ -2429,13 +2600,21 @@ def main(args: Optional[argparse.Namespace] = None):
             )
         if args.total_tokens is not None:
             tokens_per_step = args.batch_size * args.max_length
-            args.total_steps = max(1, math.ceil(args.total_tokens / tokens_per_step))
+            args.total_steps = derive_steps_from_token_budget(args, args.total_tokens)
             if main_proc:
-                actual_tokens = args.total_steps * tokens_per_step
+                actual_tokens = token_superposition_tokens_seen(
+                    args, args.total_steps, args.total_steps,
+                )
+                phase_note = ""
+                if token_superposition_enabled(args):
+                    phase_note = (
+                        f", phase1 bag_size={args.token_superposition_bag_size}, "
+                        f"ratio={args.token_superposition_ratio:g}"
+                    )
                 print(
                     f"  Token budget: --total-tokens={args.total_tokens:,} "
                     f"-> total_steps={args.total_steps:,} "
-                    f"({tokens_per_step:,} tokens/step, "
+                    f"({tokens_per_step:,} standard tokens/step{phase_note}, "
                     f"actual budget after rounding = {actual_tokens:,} "
                     f"tokens)"
                 )
@@ -2448,11 +2627,21 @@ def main(args: Optional[argparse.Namespace] = None):
         train_loader, val_loader = build_streaming_loaders(
             args, tokenizer,
         )
+        if token_superposition_enabled(args):
+            phase1_block_size = token_superposition_phase1_block_size(args)
+            if main_proc:
+                print(
+                    "Building TST phase-1 streaming train loader with "
+                    f"block_size={phase1_block_size}"
+                )
+            phase1_train_loader = build_streaming_train_loader(
+                args, tokenizer, phase1_block_size,
+            )
     else:
         # ``--dataset`` may be a Hub name, a local file (.json/.csv/.txt),
         # or a local directory holding a saved-to-disk HF dataset
         # (e.g. a partial snapshot of fineweb-edu sample-10BT).
-        def _load_and_preprocess():
+        def _load_dataset_raw():
             if main_proc:
                 print(f"Loading dataset: "
                       f"{_describe_dataset_source(args.dataset, args.dataset_config)}")
@@ -2483,18 +2672,40 @@ def main(args: Optional[argparse.Namespace] = None):
                 if main_proc:
                     print(f"  Subset validation to {n} examples")
 
-            if main_proc:
-                print(f"Preprocessing with block_size={args.max_length} ...")
-            ds = preprocess_dataset(
-                ds, tokenizer, args.max_length, text_column=args.text_column
-            )
             return ds
 
-        dataset = _load_and_preprocess()
+        raw_dataset = _load_dataset_raw()
+
+        if main_proc:
+            print(f"Preprocessing with block_size={args.max_length} ...")
+        dataset = preprocess_dataset(
+            raw_dataset, tokenizer, args.max_length, text_column=args.text_column
+        )
+        phase1_dataset = None
+        if token_superposition_enabled(args):
+            phase1_block_size = token_superposition_phase1_block_size(args)
+            if main_proc:
+                print(
+                    "Preprocessing TST phase-1 train split with "
+                    f"block_size={phase1_block_size} ..."
+                )
+            phase1_dataset = preprocess_dataset(
+                DatasetDict({"train": raw_dataset["train"]}),
+                tokenizer,
+                phase1_block_size,
+                text_column=args.text_column,
+            )
 
         if main_proc:
             print(f"  train examples:      {len(dataset['train'])}")
             print(f"  validation examples: {len(dataset['validation'])}")
+            if phase1_dataset is not None:
+                print(f"  TST phase-1 examples: {len(phase1_dataset['train'])}")
+        if phase1_dataset is not None and len(phase1_dataset["train"]) == 0:
+            raise ValueError(
+                "TST phase-1 preprocessing produced zero train examples; "
+                "reduce --max-length or --tst-bag-size, or use more data."
+            )
 
         train_loader = create_dataloader(
             dataset["train"], args.batch_size, shuffle=True,
@@ -2508,6 +2719,14 @@ def main(args: Optional[argparse.Namespace] = None):
             prefetch_factor=args.prefetch_factor,
             seed=args.seed,
         )
+        phase1_train_loader = None
+        if phase1_dataset is not None:
+            phase1_train_loader = create_dataloader(
+                phase1_dataset["train"], args.batch_size, shuffle=True,
+                num_workers=args.num_workers,
+                prefetch_factor=args.prefetch_factor,
+                seed=args.seed,
+            )
 
     config, model = build_model(args, vocab_size=tokenizer.vocab_size)
     model = model.to(device)
@@ -2515,6 +2734,13 @@ def main(args: Optional[argparse.Namespace] = None):
         print(f"\nModel: {type(model).__name__}")
         print(f"  parameters: {count_parameters(model):,}")
         print(f"  use_moe:    {config.use_moe}")
+        if token_superposition_enabled(args):
+            print(
+                "  TST:        "
+                f"bag_size={args.token_superposition_bag_size}, "
+                f"ratio={args.token_superposition_ratio:g}, "
+                f"phase1_block={token_superposition_phase1_block_size(args)}"
+            )
         if config.use_moe:
             print(f"  shared experts: {config.num_shared_experts}")
             print(f"  sparse experts: {config.num_sparse_experts}")
@@ -2525,6 +2751,8 @@ def main(args: Optional[argparse.Namespace] = None):
         args.total_steps if args.streaming
         else len(train_loader) * args.epochs
     )
+    if token_superposition_enabled(args) and not args.streaming:
+        args.total_steps = total_steps
 
     muon_params, embed_params, default_params, router_params = split_param_groups(model)
     optimizer, scheduler, muon_hp = build_optimizer_and_scheduler(
@@ -2667,12 +2895,27 @@ def main(args: Optional[argparse.Namespace] = None):
             print(f"  Compiling model with torch.compile (mode={args.compile_mode})...")
         model = torch.compile(model, mode=args.compile_mode)
 
-    if args.streaming:
+    if args.streaming or token_superposition_enabled(args):
+        if token_superposition_enabled(args) and not args.streaming:
+            steps_per_epoch = max(1, len(train_loader))
+            if main_proc:
+                print(
+                    "  TST uses step-based training; converting finite-mode "
+                    f"eval/save/sample intervals by {steps_per_epoch} "
+                    "steps per epoch."
+                )
+            if args.eval_every > 0:
+                args.eval_every *= steps_per_epoch
+            if args.save_every > 0:
+                args.save_every *= steps_per_epoch
+            if args.sample_every > 0:
+                args.sample_every *= steps_per_epoch
         result = run_step_training(
             args, model, raw_model, optimizer, scheduler, muon_hp, ema_model,
             train_loader, val_loader, device, use_amp, mp_dtype,
             save_dir, sample_text, total_steps, start_step=start_step,
             diagnostic_monitor=diagnostic_monitor, model_config=config,
+            phase1_train_loader=phase1_train_loader,
         )
         history = result["history"]
         best_val_loss = result["best_val_loss"]
@@ -2689,6 +2932,13 @@ def main(args: Optional[argparse.Namespace] = None):
                 "best_val_loss": best_val_loss,
                 "history": history,
             }
+            if token_superposition_enabled(args):
+                history_payload["token_superposition"] = {
+                    "bag_size": args.token_superposition_bag_size,
+                    "ratio": args.token_superposition_ratio,
+                    "phase1_steps": token_superposition_phase1_steps(args, total_steps),
+                    "phase1_block_size": token_superposition_phase1_block_size(args),
+                }
             if wandb_run is not None:
                 history_payload["wandb"] = {
                     "run_id": wandb_run.id,

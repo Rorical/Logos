@@ -12,6 +12,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.lm_loss import (
+    lm_cross_entropy_from_logits,
+    token_superposition_attention_mask,
+    token_superposition_embeddings,
+)
 from models.baseline import (
     BaselineConfig,
     RMSNorm,
@@ -259,8 +264,14 @@ class ResidualTransformer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         is_causal: bool = True,
+        token_superposition_bag_size: int = 1,
     ) -> Dict[str, Any]:
-        x = self.token_emb(input_ids)
+        x = token_superposition_embeddings(
+            self.token_emb, input_ids, token_superposition_bag_size,
+        )
+        attention_mask = token_superposition_attention_mask(
+            attention_mask, token_superposition_bag_size,
+        )
 
         # Embedding is "block 0"; the first block starts with no
         # accumulated partial (None), matching paper Eq. 6.
@@ -297,16 +308,12 @@ class ResidualTransformer(nn.Module):
 
         lm_loss: Optional[torch.Tensor] = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :]
-            shift_labels = labels[..., 1:]
-            flat_labels = shift_labels.reshape(-1)
-            loss_sum = F.cross_entropy(
-                shift_logits.reshape(-1, shift_logits.size(-1)),
-                flat_labels,
+            lm_loss = lm_cross_entropy_from_logits(
+                logits,
+                labels,
+                token_superposition_bag_size=token_superposition_bag_size,
                 ignore_index=-100,
-                reduction="sum",
             )
-            lm_loss = loss_sum / (flat_labels != -100).sum().clamp_min(1)
         loss = combine_lm_and_aux_loss(
             lm_loss,
             aux_loss if self.config.use_moe else None,

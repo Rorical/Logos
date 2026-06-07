@@ -41,7 +41,10 @@ from models.hybrid import (
 from models.residual import BlockAttentionResidual
 from models.lm_loss import (
     chunked_linear_cross_entropy,
+    lm_cross_entropy_from_logits,
     standard_lm_cross_entropy,
+    token_superposition_attention_mask,
+    token_superposition_embeddings,
 )
 
 
@@ -304,7 +307,17 @@ class LogosTransformer(nn.Module):
         hidden: torch.Tensor,
         labels: torch.Tensor,
         logits: Optional[torch.Tensor] = None,
+        token_superposition_bag_size: int = 1,
     ) -> torch.Tensor:
+        if int(token_superposition_bag_size) > 1:
+            if logits is None:
+                logits = self.lm_head(hidden)
+            return lm_cross_entropy_from_logits(
+                logits,
+                labels,
+                token_superposition_bag_size=token_superposition_bag_size,
+                ignore_index=-100,
+            )
         chunk_size = int(getattr(self.config, "lm_head_chunk_size", 0) or 0)
         if chunk_size > 0 and logits is None:
             return chunked_linear_cross_entropy(
@@ -326,8 +339,14 @@ class LogosTransformer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         is_causal: bool = True,
+        token_superposition_bag_size: int = 1,
     ) -> Dict[str, Any]:
-        x = self.token_emb(input_ids)
+        x = token_superposition_embeddings(
+            self.token_emb, input_ids, token_superposition_bag_size,
+        )
+        attention_mask = token_superposition_attention_mask(
+            attention_mask, token_superposition_bag_size,
+        )
 
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []
@@ -420,13 +439,19 @@ class LogosTransformer(nn.Module):
         x = self.final_norm(h_main)
         use_chunked_lm_loss = (
             labels is not None
+            and int(token_superposition_bag_size) <= 1
             and int(getattr(self.config, "lm_head_chunk_size", 0) or 0) > 0
         )
         logits = None if use_chunked_lm_loss else self.lm_head(x)
 
         lm_loss: Optional[torch.Tensor] = None
         if labels is not None:
-            lm_loss = self._lm_loss(x, labels, logits=logits)
+            lm_loss = self._lm_loss(
+                x,
+                labels,
+                logits=logits,
+                token_superposition_bag_size=token_superposition_bag_size,
+            )
         loss = combine_lm_and_aux_loss(
             lm_loss,
             aux_loss if self.config.use_moe else None,
