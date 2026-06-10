@@ -991,6 +991,7 @@ def build_model(args: argparse.Namespace, vocab_size: int):
             hca_compression=args.hca_compression,
             compressed_query_dim=args.compressed_query_dim,
             compressed_head_dim=args.compressed_head_dim,
+            compressed_rope=args.compressed_rope,
             attn_pattern=args.attn_pattern,
         )
     elif args.model == "recursive":
@@ -1022,6 +1023,7 @@ def build_model(args: argparse.Namespace, vocab_size: int):
             hca_compression=args.hca_compression,
             compressed_query_dim=args.compressed_query_dim,
             compressed_head_dim=args.compressed_head_dim,
+            compressed_rope=args.compressed_rope,
             attn_pattern=args.attn_pattern,
             entry_attn_pattern=args.entry_attn_pattern,
             body_attn_pattern=args.body_attn_pattern,
@@ -2557,6 +2559,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="[hybrid,logos] Low-rank query bottleneck for CSA/HCA. Defaults to compressed head dim.")
     parser.add_argument("--compressed-head-dim", type=int, default=None,
                         help="[hybrid,logos] Per-head CSA/HCA shared-KV dimension. Defaults to --head-dim.")
+    parser.add_argument("--compressed-rope", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="[hybrid,logos] Apply rotary position embedding to "
+                             "CSA/HCA compressed-attention q/k and the CSA indexer "
+                             "q/k (NSA/DSA: pooled keys rotate at their group's last "
+                             "token). --no-compressed-rope restores the old "
+                             "position-free compressed attention.")
     parser.add_argument("--attn-pattern", type=str, default=None,
                         help="[hybrid,logos] Comma/semicolon pattern over kda,swa,csa,hca. "
                              "For Logos, applies globally only when section-specific patterns are unset.")

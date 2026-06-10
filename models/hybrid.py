@@ -25,6 +25,7 @@ from models.linear import LinearConfig, KimiDeltaAttention
 from models.baseline import (
     RMSNorm,
     Attention,
+    RotaryEmbedding,
     SwiGLU,
     MoELayer,
     combine_lm_and_aux_loss,
@@ -119,6 +120,13 @@ class HybridConfig(LinearConfig):
     hca_compression: int = 128
     compressed_query_dim: Optional[int] = None
     compressed_head_dim: Optional[int] = None
+    # Apply rotary position embedding to the CSA/HCA compressed-attention q/k
+    # (and the CSA indexer q/k). Queries rotate at their true token position;
+    # pooled keys rotate at a per-group representative position (the group's
+    # last token). Default ON, following NSA/DSA evidence that the indexer and
+    # compressed attention need positional geometry (a missing/mismatched
+    # indexer RoPE was a published DSA bug). Off => bit-identical to no-RoPE.
+    compressed_rope: bool = True
 
     # Comma/semicolon-separated pattern, e.g. "hca,csa,csa,swa".
     # If unset, Hybrid preserves the old structural KDA/SWA schedule.
@@ -418,6 +426,21 @@ class CompressedGlobalAttention(nn.Module):
             config.d_model, self.head_dim, self.compression, overlap=overlap,
         )
 
+        # Partial RoPE for queries (rotated at true token positions) and pooled
+        # keys (rotated at a per-group representative position). Mirrors the
+        # baseline Attention partial-rope geometry; default rotates the full
+        # compressed head dim. Even-dim required by the rotate-half layout.
+        self.compressed_rope = config.compressed_rope
+        if self.compressed_rope:
+            rope_dim = config.partial_rope_dim
+            if rope_dim is None or rope_dim > self.head_dim:
+                rope_dim = self.head_dim
+            rope_dim -= rope_dim % 2
+            self.rope_dim = rope_dim
+            self.rotary = RotaryEmbedding(
+                rope_dim, config.max_seq_len, config.rope_base,
+            )
+
         if self.sparse:
             self.indexer_q_down = nn.Linear(config.d_model, self.query_dim, bias=False)
             self.indexer_q_up = nn.Linear(
@@ -430,20 +453,54 @@ class CompressedGlobalAttention(nn.Module):
             self.indexer_heads = config.csa_indexer_heads
             self.indexer_dim = config.csa_indexer_dim
             self.indexer_loss_weight = config.csa_indexer_loss_weight
+            if self.compressed_rope:
+                idx_rope_dim = min(self.rope_dim, self.indexer_dim)
+                idx_rope_dim -= idx_rope_dim % 2
+                self.indexer_rope_dim = idx_rope_dim
+                if idx_rope_dim > 0:
+                    self.indexer_rotary = RotaryEmbedding(
+                        idx_rope_dim, config.max_seq_len, config.rope_base,
+                    )
 
         self.out_proj = nn.Linear(config.num_heads * self.head_dim, config.d_model, bias=False)
         self.attention_sink = config.attention_sink
         if self.attention_sink:
             self.sink_logit = nn.Parameter(torch.zeros(config.num_heads))
 
+    def _group_positions(self, G: int, T: int, device: torch.device) -> torch.Tensor:
+        """Representative absolute position for each compressed group.
+
+        Group ``g`` aggregates raw tokens spanning the a-window ``[g*c, g*c+c)``
+        (and, when overlapping, the b-window to its left); its representative is
+        the a-window's LAST token ``g*c+c-1``, clamped to the final real token
+        ``T-1`` for the trailing partial group. This matches the causal boundary
+        used in scoring, so a query at ``t`` sees only groups whose rep position
+        ``<= t``. ``torch.arange`` keeps this torch.compile/XLA-safe.
+        """
+        g_idx = torch.arange(G, device=device, dtype=torch.long)
+        pos = (g_idx + 1) * self.compression - 1
+        return pos.clamp_max(T - 1)
+
+    def _rope_partial(
+        self, x: torch.Tensor, positions: torch.Tensor, rotary: nn.Module, rope_dim: int
+    ) -> torch.Tensor:
+        """Partial RoPE on the last ``rope_dim`` channels of ``x`` at ``positions``."""
+        if rope_dim >= x.shape[-1]:
+            return rotary.forward_at_positions(x, positions)
+        no_rope = x[..., :-rope_dim]
+        rope = rotary.forward_at_positions(x[..., -rope_dim:], positions)
+        return torch.cat([no_rope, rope], dim=-1)
+
     def _build_scores(
         self,
         q: torch.Tensor,
         kv: torch.Tensor,
+        kv_index: torch.Tensor,
         group_valid: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         is_causal: bool,
         hidden: torch.Tensor,
+        positions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         scores = torch.einsum("bhtd,bnd->bhtn", q, kv) / (self.head_dim ** 0.5)
         B, H, T, G = scores.shape
@@ -476,7 +533,18 @@ class CompressedGlobalAttention(nn.Module):
             invalid = torch.isinf(scores).all(dim=1)  # [B, T, G]
             q_i = self.indexer_q_up(self.indexer_q_down(hidden.detach()))
             q_i = q_i.view(B, T, self.indexer_heads, self.indexer_dim)
-            k_i = self.indexer_k_proj(kv.detach())
+            k_i = self.indexer_k_proj(kv_index.detach())
+            if self.compressed_rope and self.indexer_rope_dim > 0:
+                # Same positional geometry as the compressed attention so the
+                # indexer ranks blocks the way the dense attention would: rotate
+                # indexer-q at per-token positions, indexer-k at group positions.
+                t_pos = torch.arange(T, device=q_i.device, dtype=torch.long)
+                q_i = self._rope_partial(
+                    q_i.transpose(1, 2), t_pos, self.indexer_rotary, self.indexer_rope_dim,
+                ).transpose(1, 2)
+                k_i = self._rope_partial(
+                    k_i, positions, self.indexer_rotary, self.indexer_rope_dim,
+                )
             idx_scores = torch.einsum("bthd,bnd->bthn", q_i, k_i)
             idx_scores = F.relu(idx_scores)
             idx_weights = self.indexer_w(hidden.detach()).transpose(1, 2).unsqueeze(-1)
@@ -544,8 +612,22 @@ class CompressedGlobalAttention(nn.Module):
         q = self.q_up(self.q_down(hidden)).view(B, T, self.num_heads, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
 
+        # RoPE (after q_norm/kv_norm, matching baseline order): queries rotate at
+        # their true token position; pooled keys rotate at a per-group
+        # representative position. The rotated kv is used ONLY for the score
+        # dot-product; the value aggregation below keeps the un-rotated kv.
+        positions = self._group_positions(kv.size(1), T, hidden.device)
+        if self.compressed_rope:
+            t_pos = torch.arange(T, device=q.device, dtype=torch.long)
+            q_score = self._rope_partial(q, t_pos, self.rotary, self.rope_dim)
+            kv_score = self._rope_partial(kv, positions, self.rotary, self.rope_dim)
+        else:
+            q_score = q
+            kv_score = kv
+
         scores, index_loss = self._build_scores(
-            q, kv, group_valid, attention_mask, is_causal, hidden,
+            q_score, kv_score, kv, group_valid, attention_mask, is_causal, hidden,
+            positions,
         )
         all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
         if self.attention_sink:

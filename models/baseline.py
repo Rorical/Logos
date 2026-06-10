@@ -194,6 +194,24 @@ class RotaryEmbedding(nn.Module):
         sin = self.sin[:, :, :seq_len, :].to(x.device)
         return x * cos + self.rotate_half(x) * sin
 
+    def forward_at_positions(
+        self, x: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Rotate ``x`` using cos/sin gathered at arbitrary integer positions.
+
+        ``positions`` is a 1-D ``long`` tensor of length ``x.shape[-2]`` (the
+        sequence axis), broadcast across batch/head dims. Used by compressed
+        attention to rotate pooled keys at a per-group representative position
+        rather than the dense ``0..seq_len`` grid. Indexing (not slicing) the
+        precomputed table keeps this torch.compile/XLA-safe; callers must clamp
+        positions into ``[0, max_seq_len)`` (no host-side bound check here so
+        the path stays free of data-dependent syncs).
+        """
+        # cos/sin are [1, 1, max_seq_len, dim]; gather the seq axis -> [L, dim].
+        cos = self.cos[0, 0].to(x.device).index_select(0, positions)
+        sin = self.sin[0, 0].to(x.device).index_select(0, positions)
+        return x * cos + self.rotate_half(x) * sin
+
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_ff: int):
