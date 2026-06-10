@@ -987,6 +987,7 @@ def build_model(args: argparse.Namespace, vocab_size: int):
             csa_top_k=args.csa_top_k,
             csa_indexer_heads=args.csa_indexer_heads,
             csa_indexer_dim=args.csa_indexer_dim,
+            csa_indexer_loss_weight=args.csa_indexer_loss_weight,
             hca_compression=args.hca_compression,
             compressed_query_dim=args.compressed_query_dim,
             compressed_head_dim=args.compressed_head_dim,
@@ -1017,6 +1018,7 @@ def build_model(args: argparse.Namespace, vocab_size: int):
             csa_top_k=args.csa_top_k,
             csa_indexer_heads=args.csa_indexer_heads,
             csa_indexer_dim=args.csa_indexer_dim,
+            csa_indexer_loss_weight=args.csa_indexer_loss_weight,
             hca_compression=args.hca_compression,
             compressed_query_dim=args.compressed_query_dim,
             compressed_head_dim=args.compressed_head_dim,
@@ -1987,6 +1989,9 @@ def run_step_training(
         aux_loss = outputs.get("aux_loss")
         if aux_loss is None:
             aux_loss = torch.zeros((), device=loss.device, dtype=loss.dtype)
+        indexer_loss = outputs.get("indexer_loss")
+        if indexer_loss is None:
+            indexer_loss = torch.zeros((), device=loss.device, dtype=loss.dtype)
         loss.backward()
         # Per-group pre-clip norms so wandb can plot them and a single
         # high-LR group (embed) doesn't dominate a global clip and
@@ -2058,11 +2063,16 @@ def run_step_training(
         loss_d = loss.detach().reshape(1)
         lm_loss_d = lm_loss.detach().reshape(1)
         aux_loss_d = aux_loss.detach().reshape(1)
+        indexer_loss_d = indexer_loss.detach().reshape(1)
         if grad_norm is not None:
             # Single device->host sync for loss scalars + global grad norm +
             # per-group grad norms. Keeps rank-0 wandb logging cheap even
-            # though we expose one metric per param group.
-            stack_parts = [loss_d, lm_loss_d, aux_loss_d, grad_norm.detach().reshape(1)]
+            # though we expose one metric per param group. ``indexer_loss``
+            # rides at the front so the trailing slice stays per-group norms.
+            stack_parts = [
+                loss_d, lm_loss_d, aux_loss_d, indexer_loss_d,
+                grad_norm.detach().reshape(1),
+            ]
             stack_parts.extend(
                 n.detach().reshape(1) for n in per_group_grad_norms
             )
@@ -2070,13 +2080,17 @@ def run_step_training(
             loss_val = scalars[0]
             lm_loss_val = scalars[1]
             aux_loss_val = scalars[2]
-            grad_norm_val = scalars[3]
-            per_group_grad_norm_vals = scalars[4:]
+            indexer_loss_val = scalars[3]
+            grad_norm_val = scalars[4]
+            per_group_grad_norm_vals = scalars[5:]
         else:
-            scalars = torch.cat([loss_d, lm_loss_d, aux_loss_d]).cpu().tolist()
+            scalars = torch.cat(
+                [loss_d, lm_loss_d, aux_loss_d, indexer_loss_d]
+            ).cpu().tolist()
             loss_val = scalars[0]
             lm_loss_val = scalars[1]
             aux_loss_val = scalars[2]
+            indexer_loss_val = scalars[3]
             grad_norm_val = None
             per_group_grad_norm_vals = []
         # Exclude non-finite losses from the running average so a single
@@ -2099,6 +2113,7 @@ def run_step_training(
                 "train/loss": loss_val,
                 "train/lm_loss": lm_loss_val,
                 "train/aux_loss": aux_loss_val,
+                "train/indexer_loss": indexer_loss_val,
                 "train/ppl": math.exp(min(lm_loss_val, 20)),
                 "train/tokens_seen": tokens_seen,
                 "train/tst_bag_size": bag_size,
@@ -2532,6 +2547,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="[hybrid,logos] CSA first-stage indexer head count")
     parser.add_argument("--csa-indexer-dim", type=int, default=32,
                         help="[hybrid,logos] CSA first-stage indexer head dimension")
+    parser.add_argument("--csa-indexer-loss-weight", type=float, default=1.0,
+                        help="[hybrid,logos] Weight on the CSA indexer's "
+                             "attention-aligned KL loss (DSA lightning-indexer "
+                             "style). Trains only indexer params; not decayed.")
     parser.add_argument("--hca-compression", type=int, default=128,
                         help="[hybrid,logos] HCA token compression ratio")
     parser.add_argument("--compressed-query-dim", type=int, default=None,

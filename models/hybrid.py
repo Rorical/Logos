@@ -110,6 +110,12 @@ class HybridConfig(LinearConfig):
     csa_top_k: int = 1024
     csa_indexer_heads: int = 4
     csa_indexer_dim: int = 32
+    # Weight on the CSA indexer's attention-aligned KL loss. The indexer is a
+    # separate sparse-recall selector whose top-k is non-differentiable, so it
+    # receives zero gradient otherwise. The loss trains only indexer params
+    # (trunk inputs are detached), so the weight is forgiving; 1.0 matches the
+    # DeepSeek-V3.2 lightning-indexer recipe and is not decayed.
+    csa_indexer_loss_weight: float = 1.0
     hca_compression: int = 128
     compressed_query_dim: Optional[int] = None
     compressed_head_dim: Optional[int] = None
@@ -136,6 +142,8 @@ class HybridConfig(LinearConfig):
             raise ValueError("csa_indexer_heads must be >= 1")
         if self.csa_indexer_dim < 1:
             raise ValueError("csa_indexer_dim must be >= 1")
+        if self.csa_indexer_loss_weight < 0:
+            raise ValueError("csa_indexer_loss_weight must be >= 0")
         if self.hca_compression < 1:
             raise ValueError("hca_compression must be >= 1")
         if self.compressed_query_dim is not None and self.compressed_query_dim < 1:
@@ -421,6 +429,7 @@ class CompressedGlobalAttention(nn.Module):
             self.indexer_w = nn.Linear(config.d_model, config.csa_indexer_heads, bias=False)
             self.indexer_heads = config.csa_indexer_heads
             self.indexer_dim = config.csa_indexer_dim
+            self.indexer_loss_weight = config.csa_indexer_loss_weight
 
         self.out_proj = nn.Linear(config.num_heads * self.head_dim, config.d_model, bias=False)
         self.attention_sink = config.attention_sink
@@ -435,9 +444,10 @@ class CompressedGlobalAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         is_causal: bool,
         hidden: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         scores = torch.einsum("bhtd,bnd->bhtn", q, kv) / (self.head_dim ** 0.5)
         B, H, T, G = scores.shape
+        index_loss = torch.zeros((), device=scores.device, dtype=scores.dtype)
         if is_causal:
             t_idx = torch.arange(T, device=hidden.device, dtype=torch.long)
             g_idx = torch.arange(G, device=hidden.device, dtype=torch.long)
@@ -458,35 +468,83 @@ class CompressedGlobalAttention(nn.Module):
             scores = scores.masked_fill(~attention_mask.view(B, 1, T, 1).bool(), float("-inf"))
 
         if self.sparse:
-            q_i = self.indexer_q_up(self.indexer_q_down(hidden))
+            # Per-query validity over groups (all heads masked => no valid key).
+            # The top-k mask below is non-differentiable, so the indexer would
+            # otherwise receive zero gradient. Feed it DETACHED trunk inputs so
+            # its KL loss trains only the indexer params (DSA-style isolation);
+            # this also makes the mask itself identical to the attached version.
+            invalid = torch.isinf(scores).all(dim=1)  # [B, T, G]
+            q_i = self.indexer_q_up(self.indexer_q_down(hidden.detach()))
             q_i = q_i.view(B, T, self.indexer_heads, self.indexer_dim)
-            k_i = self.indexer_k_proj(kv)
+            k_i = self.indexer_k_proj(kv.detach())
             idx_scores = torch.einsum("bthd,bnd->bthn", q_i, k_i)
             idx_scores = F.relu(idx_scores)
-            idx_weights = self.indexer_w(hidden).transpose(1, 2).unsqueeze(-1)
+            idx_weights = self.indexer_w(hidden.detach()).transpose(1, 2).unsqueeze(-1)
             idx_scores = (idx_scores.transpose(1, 2) * idx_weights).sum(dim=1)
-            idx_scores = idx_scores.masked_fill(torch.isinf(scores).all(dim=1), float("-inf"))
+            idx_scores = idx_scores.masked_fill(invalid, float("-inf"))
+
+            if self.training:
+                index_loss = self._indexer_kl_loss(scores, idx_scores, invalid)
+
             k_sel = min(self.top_k, G)
             if k_sel < G:
                 _, top_idx = idx_scores.topk(k_sel, dim=-1)
                 keep = torch.zeros_like(idx_scores, dtype=torch.bool)
                 keep.scatter_(-1, top_idx, True)
                 scores = scores.masked_fill(~keep.unsqueeze(1), float("-inf"))
-        return scores
+        return scores, index_loss
+
+    def _indexer_kl_loss(
+        self,
+        scores: torch.Tensor,
+        idx_scores: torch.Tensor,
+        invalid: torch.Tensor,
+    ) -> torch.Tensor:
+        """KL(teacher || indexer) aligning the indexer to the dense attention.
+
+        Teacher: per-head softmax over groups of the dense (pre-top-k) scores,
+        summed across heads then L1-renormalized over groups, in fp32 and
+        DETACHED. Student: log-softmax of the head-combined indexer scores over
+        groups. Averaged over query rows that have at least one valid group.
+        """
+        B, H, T, G = scores.shape
+        valid_row = (~invalid).any(dim=-1)  # [B, T]
+        n_valid = valid_row.sum()
+        if n_valid == 0:
+            return torch.zeros((), device=scores.device, dtype=scores.dtype)
+
+        # Teacher distribution over groups (detached). Fully-masked rows softmax
+        # to NaN (all -inf); zero them out and exclude via valid_row below.
+        per_head = F.softmax(scores.float(), dim=-1)  # [B, H, T, G]
+        per_head = torch.nan_to_num(per_head, nan=0.0)
+        target = per_head.sum(dim=1)  # [B, T, G]
+        target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        target = target.detach()
+
+        student_logp = F.log_softmax(
+            torch.where(invalid, torch.full_like(idx_scores, float("-inf")), idx_scores).float(),
+            dim=-1,
+        )
+        student_logp = torch.nan_to_num(student_logp, neginf=0.0)
+
+        kl = (target * (target.clamp_min(1e-9).log() - student_logp)).sum(dim=-1)  # [B, T]
+        kl = kl * valid_row.to(kl.dtype)
+        loss = kl.sum() / n_valid.to(kl.dtype)
+        return loss.to(scores.dtype)
 
     def forward(
         self,
         hidden: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         is_causal: bool = True,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T, _ = hidden.shape
         kv, group_valid = self.compressor(hidden, attention_mask)
         kv = self.kv_norm(kv)
         q = self.q_up(self.q_down(hidden)).view(B, T, self.num_heads, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
 
-        scores = self._build_scores(
+        scores, index_loss = self._build_scores(
             q, kv, group_valid, attention_mask, is_causal, hidden,
         )
         all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
@@ -502,7 +560,10 @@ class CompressedGlobalAttention(nn.Module):
         if attention_mask is not None:
             out = out * attention_mask.view(B, 1, T, 1).to(out.dtype)
         out = out.transpose(1, 2).reshape(B, T, self.num_heads * self.head_dim)
-        return self.out_proj(out)
+        out = self.out_proj(out)
+        # Return the raw (unweighted) indexer KL so the model can both surface
+        # it for logging and weight it once before adding to the train loss.
+        return out, index_loss
 
 
 class HybridAttentionLayer(nn.Module):
@@ -527,12 +588,15 @@ class HybridAttentionLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         is_causal: bool = True,
         cache: Optional[Dict[str, Any]] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         kind = normalize_attention_type(kind)
         layer = self.layers[kind]
+        zero = torch.zeros((), device=x.device, dtype=x.dtype)
         if kind == "kda":
-            return layer(x, attention_mask=attention_mask, cache=cache)
-        return layer(x, attention_mask=attention_mask, is_causal=is_causal)
+            return layer(x, attention_mask=attention_mask, cache=cache), zero
+        if kind in ("csa", "hca"):
+            return layer(x, attention_mask=attention_mask, is_causal=is_causal)
+        return layer(x, attention_mask=attention_mask, is_causal=is_causal), zero
 
 
 class HybridTransformerBlock(nn.Module):
@@ -556,8 +620,8 @@ class HybridTransformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         is_causal: bool = True,
         cache: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        attn_out = self.attn(
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        attn_out, index_loss = self.attn(
             attention_kind,
             self.attn_norm(x),
             attention_mask=attention_mask,
@@ -569,10 +633,10 @@ class HybridTransformerBlock(nn.Module):
         if self.use_moe:
             ffn_out, aux_loss, topk_indices = self.ffn(self.ffn_norm(x))
             x = x + ffn_out
-            return x, aux_loss, topk_indices
+            return x, aux_loss, topk_indices, index_loss
         x = x + self.ffn(self.ffn_norm(x))
         zero = torch.zeros((), device=x.device, dtype=x.dtype)
-        return x, zero, None
+        return x, zero, None, index_loss
 
 
 class HybridTransformer(nn.Module):
@@ -629,11 +693,12 @@ class HybridTransformer(nn.Module):
         )
 
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
+        index_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []
         for i, layer in enumerate(self.layers):
             kind = self.attn_schedule[i]
             layer_cache = caches[i] if (caches is not None and kind == "kda") else None
-            x, layer_aux, layer_topk = layer(
+            x, layer_aux, layer_topk, layer_index = layer(
                 x,
                 attention_kind=kind,
                 attention_mask=attention_mask,
@@ -641,6 +706,7 @@ class HybridTransformer(nn.Module):
                 cache=layer_cache,
             )
             aux_loss = aux_loss + layer_aux
+            index_loss = index_loss + layer_index
             topk_indices_list.append(layer_topk)
 
         x = self.final_norm(x)
@@ -659,12 +725,15 @@ class HybridTransformer(nn.Module):
             aux_loss if self.config.use_moe else None,
             self.training,
         )
+        if loss is not None and self.training:
+            loss = loss + self.config.csa_indexer_loss_weight * index_loss
 
         return {
             "logits": logits,
             "loss": loss,
             "lm_loss": lm_loss,
             "aux_loss": aux_loss if self.config.use_moe else None,
+            "indexer_loss": index_loss,
             "topk_indices": topk_indices_list if self.config.use_moe else None,
         }
 

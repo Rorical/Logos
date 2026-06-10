@@ -208,9 +208,9 @@ class LogosTransformerBlock(nn.Module):
         is_causal: bool = True,
         cache: Optional[Dict[str, Any]] = None,
         loop_idx: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         h = self.attn_res(blocks, partial)
-        attn_out = self.attn(
+        attn_out, index_loss = self.attn(
             attention_kind,
             self.attn_norm(h),
             attention_mask=attention_mask,
@@ -226,11 +226,11 @@ class LogosTransformerBlock(nn.Module):
         if self.use_moe:
             ffn_out, aux_loss, topk_indices = self.ffn(self.ffn_norm(h), loop_idx=loop_idx)
             partial = partial + ffn_out
-            return partial, aux_loss, topk_indices
+            return partial, aux_loss, topk_indices, index_loss
 
         partial = partial + self.ffn(self.ffn_norm(h))
         zero = torch.zeros((), device=partial.device, dtype=partial.dtype)
-        return partial, zero, None
+        return partial, zero, None, index_loss
 
 
 class LogosTransformer(nn.Module):
@@ -349,6 +349,7 @@ class LogosTransformer(nn.Module):
         )
 
         aux_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
+        index_loss = torch.zeros((), device=input_ids.device, dtype=x.dtype)
         topk_indices_list: List[Optional[torch.Tensor]] = []
 
         blocks: List[torch.Tensor] = [x]
@@ -377,10 +378,11 @@ class LogosTransformer(nn.Module):
             )
 
         for idx, layer in enumerate(self.entry):
-            partial, layer_aux, layer_topk = _call_block(
+            partial, layer_aux, layer_topk, layer_index = _call_block(
                 layer, blocks, partial, self.entry_attn_schedule[idx], 0,
             )
             aux_loss = aux_loss + layer_aux
+            index_loss = index_loss + layer_index
             topk_indices_list.append(layer_topk)
         if self.config.num_entry_layers > 0:
             assert partial is not None, "entry produced no partial block"
@@ -393,22 +395,25 @@ class LogosTransformer(nn.Module):
 
                 def _body_loop(blks, p, loop_i=_li):
                     aux_sum = torch.zeros((), device=blks[0].device, dtype=blks[0].dtype)
+                    index_sum = torch.zeros((), device=blks[0].device, dtype=blks[0].dtype)
                     topks: List[Optional[torch.Tensor]] = []
                     for r, block in enumerate(self.body):
                         kind = self.body_attn_schedule[loop_i * self.config.num_body_layers + r]
-                        p, la, lt = block(
+                        p, la, lt, li = block(
                             blks, p, kind,
                             attention_mask=attention_mask, is_causal=is_causal,
                             cache=None, loop_idx=loop_i,
                         )
                         aux_sum = aux_sum + la
+                        index_sum = index_sum + li
                         topks.append(lt)
-                    return p, aux_sum, topks
+                    return p, aux_sum, topks, index_sum
 
-                partial, loop_aux, loop_topks = ckpt_utils.checkpoint(
+                partial, loop_aux, loop_topks, loop_index = ckpt_utils.checkpoint(
                     _body_loop, blocks, partial, use_reentrant=False,
                 )
                 aux_loss = aux_loss + loop_aux
+                index_loss = index_loss + loop_index
                 topk_indices_list.extend(loop_topks)
             else:
                 if per_block_ckpt:
@@ -419,20 +424,22 @@ class LogosTransformer(nn.Module):
                     kind = self.body_attn_schedule[
                         loop_idx * self.config.num_body_layers + r
                     ]
-                    partial, layer_aux, layer_topk = runner(
+                    partial, layer_aux, layer_topk, layer_index = runner(
                         block, blocks, partial, kind, loop_idx,
                     )
                     aux_loss = aux_loss + layer_aux
+                    index_loss = index_loss + layer_index
                     topk_indices_list.append(layer_topk)
             assert partial is not None, f"body loop {loop_idx} produced no partial block"
             blocks = blocks + [partial]
             partial = None
 
         for idx, layer in enumerate(self.exit):
-            partial, layer_aux, layer_topk = _call_block(
+            partial, layer_aux, layer_topk, layer_index = _call_block(
                 layer, blocks, partial, self.exit_attn_schedule[idx], 0,
             )
             aux_loss = aux_loss + layer_aux
+            index_loss = index_loss + layer_index
             topk_indices_list.append(layer_topk)
 
         h_main = self.final_res(blocks, partial)
@@ -457,12 +464,15 @@ class LogosTransformer(nn.Module):
             aux_loss if self.config.use_moe else None,
             self.training,
         )
+        if loss is not None and self.training:
+            loss = loss + self.config.csa_indexer_loss_weight * index_loss
 
         return {
             "logits": logits,
             "loss": loss,
             "lm_loss": lm_loss,
             "aux_loss": aux_loss if self.config.use_moe else None,
+            "indexer_loss": index_loss,
             "topk_indices": topk_indices_list if self.config.use_moe else None,
         }
 

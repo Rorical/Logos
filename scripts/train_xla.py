@@ -189,16 +189,16 @@ def _reduce_loss_triplet(
     loss: torch.Tensor,
     lm_loss: Optional[torch.Tensor],
     aux_loss: Optional[torch.Tensor],
+    indexer_loss: Optional[torch.Tensor] = None,
 ) -> list[float]:
-    pair = torch.stack([
+    zero = torch.zeros((), device=loss.device, dtype=loss.dtype)
+    parts = [
         loss.detach(),
         (lm_loss if lm_loss is not None else loss).detach(),
-        (
-            aux_loss.detach()
-            if aux_loss is not None
-            else torch.zeros((), device=loss.device, dtype=loss.dtype)
-        ),
-    ])
+        (aux_loss.detach() if aux_loss is not None else zero),
+        (indexer_loss.detach() if indexer_loss is not None else zero),
+    ]
+    pair = torch.stack(parts)
     pair = _xla_all_reduce_mean(xm, pair)
     return pair.cpu().tolist()
 
@@ -342,7 +342,7 @@ def run_epoch_xla(
                 ema_model.update_parameters(raw_model)
 
         batch_size = input_ids.size(0)
-        loss_val, lm_loss_val, aux_loss_val = _reduce_loss_triplet(
+        loss_val, lm_loss_val, aux_loss_val, _ = _reduce_loss_triplet(
             xm, loss, outputs.get("lm_loss"), outputs.get("aux_loss"),
         )
         total_loss += loss_val * batch_size
@@ -596,8 +596,9 @@ def run_step_training_xla(
             log_moe_load_xla(xm, args, topk_indices, step + 1)
 
         step += 1
-        loss_val, lm_loss_val, aux_loss_val = _reduce_loss_triplet(
+        loss_val, lm_loss_val, aux_loss_val, indexer_loss_val = _reduce_loss_triplet(
             xm, loss, outputs.get("lm_loss"), outputs.get("aux_loss"),
+            outputs.get("indexer_loss"),
         )
         grad_norm_val = grad_norm.detach().cpu().item() if grad_norm is not None else None
         running_loss += loss_val
@@ -615,6 +616,7 @@ def run_step_training_xla(
                 "train/loss": loss_val,
                 "train/lm_loss": lm_loss_val,
                 "train/aux_loss": aux_loss_val,
+                "train/indexer_loss": indexer_loss_val,
                 "train/ppl": math.exp(min(lm_loss_val, 20)),
                 "train/tokens_seen": tokens_seen,
                 "train/tst_bag_size": bag_size,
