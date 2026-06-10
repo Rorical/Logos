@@ -733,6 +733,249 @@ class DiagnosticsMonitor:
                             break  # one warning per group is enough
         return issues
 
+    # ------------------------------------------------------------------
+    # wandb metric collection (numeric curves, not warnings)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def collect_metrics(
+        self,
+        *,
+        raw_model: "nn.Module",
+        optimizer,
+    ) -> Dict[str, float]:
+        """Cheap weight/optimizer-derived scalars for wandb plotting.
+
+        Unlike ``check`` (which emits threshold warnings) this returns the
+        raw discriminating curves an audit needs to diagnose a plateau:
+        per-section BlockAttentionResidual ``proj`` magnitude, tied-embedding
+        row-RMS stats, and per-group optimizer update/weight ratios. Pure
+        weight reads — no forward pass — so it is safe to call on every
+        diagnostic-cadence step. Keys are stable and namespaced under
+        ``diag/``; the caller wandb-logs the dict verbatim.
+        """
+        if self.disable:
+            return {}
+        metrics: Dict[str, float] = {}
+        metrics.update(self._proj_section_metrics(raw_model))
+        metrics.update(self._embed_metrics(raw_model))
+        metrics.update(self._opt_update_ratio_metrics(optimizer))
+        return metrics
+
+    def _proj_section_metrics(self, model) -> Dict[str, float]:
+        """Per-section (entry/body/exit/final) BlockAttentionResidual proj
+        abs-mean. Classifies each BAR module by its parameter name so a
+        single section's mixing weights staying inert is visible even when
+        the global average looks healthy."""
+        sections: Dict[str, List[float]] = {
+            "entry": [], "body": [], "exit": [], "final": [], "other": [],
+        }
+        for name, mod in model.named_modules():
+            if not (hasattr(mod, "proj") and hasattr(mod, "norm")):
+                continue
+            w = getattr(mod, "proj")
+            if not (isinstance(w, torch.Tensor) and w.numel() > 0):
+                continue
+            val = w.detach().abs().float().mean().item()
+            if ".entry." in name or name.startswith("entry."):
+                sections["entry"].append(val)
+            elif ".body." in name or name.startswith("body."):
+                sections["body"].append(val)
+            elif ".exit." in name or name.startswith("exit."):
+                sections["exit"].append(val)
+            elif "final" in name:
+                sections["final"].append(val)
+            else:
+                sections["other"].append(val)
+        out: Dict[str, float] = {}
+        all_vals: List[float] = []
+        for sec, vals in sections.items():
+            if not vals:
+                continue
+            all_vals.extend(vals)
+            out[f"diag/bar_proj_abs_mean/{sec}"] = sum(vals) / len(vals)
+        if all_vals:
+            out["diag/bar_proj_abs_mean"] = sum(all_vals) / len(all_vals)
+        return out
+
+    def _embed_metrics(self, model) -> Dict[str, float]:
+        """Tied-embedding health: per-row RMS (||W_emb[row]||) mean and max.
+
+        A collapsing or exploding embedding table is a leading cause of a
+        PPL plateau when the head is weight-tied. ``token_emb.weight`` is the
+        canonical name across the model family; ``lm_head.weight`` is the same
+        tensor when tied so we read whichever is present first.
+        """
+        emb = None
+        for name, p in model.named_parameters():
+            if name.endswith("token_emb.weight"):
+                emb = p
+                break
+        if emb is None:
+            for name, p in model.named_parameters():
+                if name.endswith("lm_head.weight"):
+                    emb = p
+                    break
+        if emb is None or emb.dim() != 2 or emb.numel() == 0:
+            return {}
+        row_rms = emb.detach().float().pow(2).mean(dim=1).sqrt()
+        return {
+            "diag/embed_row_rms_mean": row_rms.mean().item(),
+            "diag/embed_row_rms_max": row_rms.max().item(),
+        }
+
+    def _opt_update_ratio_metrics(self, optimizer) -> Dict[str, float]:
+        """Per-group update/weight ratio = lr * mean|grad-driven update| /
+        mean|weight|, a scale-free measure of how fast each group is moving.
+
+        For AdamW the per-step update magnitude is ~lr (the normalized step is
+        O(1)); for Muon the orthogonalized update is also O(1) scaled by lr.
+        We approximate the update with ``lr * mean(|exp_avg| or |grad|)`` so a
+        frozen group (ratio -> 0) or a runaway group is visible without a
+        second forward/backward.
+        """
+        out: Dict[str, float] = {}
+        sub_opts = getattr(optimizer, "optimizers", [optimizer])
+        for opt in sub_opts:
+            kind = type(opt).__name__.lower()
+            for gi, g in enumerate(opt.param_groups):
+                lr = float(g.get("lr", 0.0))
+                tag = g.get("name") or f"{kind}_g{gi}"
+                w_means: List[torch.Tensor] = []
+                u_means: List[torch.Tensor] = []
+                for p in g["params"]:
+                    if p.numel() == 0:
+                        continue
+                    w_means.append(p.detach().abs().float().mean())
+                    st = opt.state.get(p)
+                    upd = None
+                    if st:
+                        upd = st.get("exp_avg")
+                        if upd is None:
+                            upd = st.get("momentum_buffer")
+                    if upd is None and p.grad is not None:
+                        upd = p.grad
+                    if upd is not None and torch.is_tensor(upd) and upd.numel() > 0:
+                        u_means.append(upd.detach().abs().float().mean())
+                if not w_means or not u_means:
+                    continue
+                w_mean = torch.stack(w_means).mean().item()
+                u_mean = torch.stack(u_means).mean().item()
+                if w_mean <= 0:
+                    continue
+                out[f"diag/update_weight_ratio/{tag}"] = lr * u_mean / w_mean
+        return out
+
+    @torch.no_grad()
+    def probe_metrics(
+        self,
+        *,
+        raw_model: "nn.Module",
+        forward_fn,
+    ) -> Dict[str, float]:
+        """Run ONE instrumented eval-style forward to read dynamic activation
+        stats that require a forward pass: per-attention-kind output RMS,
+        per-section BlockAttentionResidual depth-softmax entropy (distance from
+        uniform averaging), and final-logit RMS + max|logit|.
+
+        ``forward_fn`` is a zero-arg callable that invokes ``raw_model`` on the
+        current batch and returns its output dict. The caller runs this OUTSIDE
+        the compiled training callable (on the uncompiled ``raw_model`` under
+        ``torch.no_grad`` + ``eval``) so hooks neither slow normal steps nor
+        break ``torch.compile``. Hooks are always removed in a ``finally``.
+        """
+        if self.disable:
+            return {}
+
+        attn_rms: Dict[str, List[float]] = {}
+        bar_entropy: Dict[str, List[float]] = {}
+        handles: List[Any] = []
+
+        def _attn_hook(kind: str):
+            def hook(_mod, _inp, out):
+                t = out[0] if isinstance(out, tuple) else out
+                if torch.is_tensor(t) and t.numel() > 0:
+                    attn_rms.setdefault(kind, []).append(
+                        t.detach().float().pow(2).mean().sqrt().item()
+                    )
+            return hook
+
+        def _bar_hook(section: str):
+            def hook(mod, inp, _out):
+                # Recompute the depth-softmax distribution from this module's
+                # inputs so we can measure its entropy. Mirrors
+                # BlockAttentionResidual.forward's stacking + logit step.
+                blocks = inp[0]
+                partial = inp[1] if len(inp) > 1 else None
+                if not blocks:
+                    return
+                if partial is None:
+                    values = torch.stack(blocks, dim=0)
+                else:
+                    values = torch.stack(list(blocks) + [partial], dim=0)
+                if values.shape[0] < 2:
+                    return  # single block -> softmax is trivially 1.0
+                keys = mod.norm(values)
+                logits = (keys * mod.proj).sum(dim=-1, keepdim=True)
+                weights = torch.softmax(logits.float(), dim=0)  # [N,B,T,1]
+                w = weights.squeeze(-1)  # [N, B, T]
+                ent = -(w * (w.clamp_min(1e-12)).log()).sum(dim=0)
+                norm_ent = (ent / math.log(w.shape[0])).mean().item()
+                bar_entropy.setdefault(section, []).append(norm_ent)
+            return hook
+
+        def _section_for(name: str) -> str:
+            if ".entry." in name or name.startswith("entry."):
+                return "entry"
+            if ".body." in name or name.startswith("body."):
+                return "body"
+            if ".exit." in name or name.startswith("exit."):
+                return "exit"
+            if "final" in name:
+                return "final"
+            return "other"
+
+        was_training = raw_model.training
+        try:
+            for name, mod in raw_model.named_modules():
+                t = type(mod).__name__
+                if t == "KimiDeltaAttention":
+                    handles.append(mod.register_forward_hook(_attn_hook("kda")))
+                elif t == "LocalAttention":
+                    handles.append(mod.register_forward_hook(_attn_hook("swa")))
+                elif t == "CompressedGlobalAttention":
+                    kind = getattr(mod, "mode", "csa") or "csa"
+                    handles.append(mod.register_forward_hook(_attn_hook(kind)))
+                elif hasattr(mod, "proj") and hasattr(mod, "norm"):
+                    handles.append(
+                        mod.register_forward_hook(_bar_hook(_section_for(name)))
+                    )
+            raw_model.eval()
+            outputs = forward_fn()
+        finally:
+            for h in handles:
+                h.remove()
+            raw_model.train(was_training)
+
+        metrics: Dict[str, float] = {}
+        for kind, vals in attn_rms.items():
+            if vals:
+                metrics[f"diag/attn_out_rms/{kind}"] = sum(vals) / len(vals)
+        for sec, vals in bar_entropy.items():
+            if vals:
+                metrics[f"diag/bar_depth_entropy/{sec}"] = sum(vals) / len(vals)
+        if bar_entropy:
+            flat = [v for vals in bar_entropy.values() for v in vals]
+            if flat:
+                metrics["diag/bar_depth_entropy"] = sum(flat) / len(flat)
+
+        logits = outputs.get("logits") if isinstance(outputs, dict) else None
+        if torch.is_tensor(logits) and logits.numel() > 0:
+            lf = logits.detach().float()
+            metrics["diag/logit_rms"] = lf.pow(2).mean().sqrt().item()
+            metrics["diag/logit_abs_max"] = lf.abs().max().item()
+        return metrics
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -514,6 +514,11 @@ def _moe_runtime_scalar_stats(model: nn.Module) -> Dict[str, float]:
     """Current non-persistent MoE controller scales for logging."""
     noise_vals: list = []
     aux_vals: list = []
+    # Signed span of every router balance bias buffer. ``get_balance_stats``
+    # only exposes abs mean/max; the SIGNED range (max - min) shows whether the
+    # bias controller is fighting a lopsided load (one expert pushed far
+    # negative while another saturates positive) rather than near-uniform.
+    bias_ranges: list = []
     for mod in model.modules():
         noise = getattr(mod, "router_noise_scale", None)
         aux = getattr(mod, "moe_aux_loss_scale", None)
@@ -521,6 +526,14 @@ def _moe_runtime_scalar_stats(model: nn.Module) -> Dict[str, float]:
             noise_vals.append(noise.detach().float())
         if isinstance(aux, torch.Tensor):
             aux_vals.append(aux.detach().float())
+        bias = getattr(mod, "bias", None)
+        if (
+            isinstance(bias, torch.Tensor)
+            and getattr(mod, "router", None) is not None
+            and bias.numel() > 0
+        ):
+            b = bias.detach().float()
+            bias_ranges.append((b.max() - b.min()))
     stats: Dict[str, float] = {}
     if noise_vals:
         vals = torch.stack(noise_vals).cpu().tolist()
@@ -530,6 +543,10 @@ def _moe_runtime_scalar_stats(model: nn.Module) -> Dict[str, float]:
         vals = torch.stack(aux_vals).cpu().tolist()
         stats["aux_scale_mean"] = sum(vals) / len(vals)
         stats["aux_scale_max"] = max(vals)
+    if bias_ranges:
+        vals = torch.stack(bias_ranges).cpu().tolist()
+        stats["bias_range_mean"] = sum(vals) / len(vals)
+        stats["bias_range_max"] = max(vals)
     return stats
 
 
@@ -1945,7 +1962,18 @@ def run_step_training(
     # post-shuffle source documents have been consumed. Seeded from the
     # resume position so a restart's first save reflects total progress.
     docs_consumed = int(getattr(args, "stream_docs_consumed", 0) or 0)
+    # One-shot resume marker so a wandb run started from a checkpoint records
+    # where it picked up (step + corpus position) instead of silently
+    # continuing the x-axis. Logged once, before the first optimizer step.
+    if main and start_step > 0:
+        wandb_log({
+            "train/resumed_from_step": start_step,
+            "train/resumed_docs_consumed": docs_consumed,
+        }, step=start_step)
+    grad_clip_events = 0
+    last_step_time_ms = float("nan")
     while step < total_steps:
+        step_t0 = time.time()
         if cudagraph_mark is not None:
             cudagraph_mark()
         bag_size = token_superposition_bag_size_for_step(args, step, total_steps)
@@ -2004,6 +2032,11 @@ def run_step_training(
             grad_norm, per_group_grad_norms = clip_grads_per_group(
                 optimizer, grad_clip,
             )
+            # Count steps where the (combined, pre-clip) norm exceeded the
+            # budget so the activation rate (events / step) is plottable — a
+            # clip that fires every step silently caps the effective LR.
+            if grad_norm is not None and grad_norm.detach().item() > grad_clip:
+                grad_clip_events += 1
         else:
             grad_norm, per_group_grad_norms = None, []
 
@@ -2059,6 +2092,11 @@ def run_step_training(
             log_moe_load(args, topk_indices, step + 1)
 
         step += 1
+        # Wall-clock for the step's compute (forward + backward + optimizer +
+        # MoE instrumentation). Read at log cadence into train/step_time_ms;
+        # the diagnostic probe / eval / checkpoint tails are deliberately
+        # excluded so the curve reflects the trainable hot path.
+        last_step_time_ms = (time.time() - step_t0) * 1000.0
         # Detach so the backward graph is untouched; stack with optional
         # grad_norm to pull everything to CPU in a single sync instead of
         # multiple .item() stalls.
@@ -2197,6 +2235,14 @@ def run_step_training(
             if nonfinite_skips:
                 postfix["skips"] = str(nonfinite_skips)
                 wandb_extra["train/nonfinite_skips"] = nonfinite_skips
+            # Throughput + optimizer-health rates, cheap and at log cadence.
+            wandb_extra["train/step_time_ms"] = last_step_time_ms
+            wandb_extra["train/docs_consumed"] = docs_consumed
+            wandb_extra["train/nonfinite_skip_rate"] = nonfinite_skips / max(step, 1)
+            if grad_clip > 0:
+                wandb_extra["train/grad_clip_active_rate"] = (
+                    grad_clip_events / max(step - start_step, 1)
+                )
             pbar.set_postfix(postfix)
             wandb_log({
                 "train/avg_loss": avg,
@@ -2229,6 +2275,32 @@ def run_step_training(
             if diag_lines:
                 for line in diag_lines:
                     pbar.write(line)
+            # Numeric diagnostic curves -> wandb. The static reads (proj /
+            # embed / update ratios) are weight-only and cheap. The probe is
+            # ONE no-grad forward on the uncompiled raw_model reusing this
+            # step's batch — outside the compiled training callable so it
+            # neither slows normal steps nor triggers a recompile.
+            diag_metrics = diagnostic_monitor.collect_metrics(
+                raw_model=raw_model, optimizer=optimizer,
+            )
+            try:
+                def _probe_forward():
+                    with torch.autocast(
+                        device_type=device.type, dtype=mp_dtype, enabled=use_amp,
+                    ):
+                        return raw_model(
+                            input_ids=ids, attention_mask=None,
+                            labels=None, is_causal=True,
+                        )
+                diag_metrics.update(
+                    diagnostic_monitor.probe_metrics(
+                        raw_model=raw_model, forward_fn=_probe_forward,
+                    )
+                )
+            except Exception as exc:  # probe is best-effort instrumentation
+                pbar.write(f"[diag] probe skipped: {type(exc).__name__}: {exc}")
+            if diag_metrics:
+                wandb_log(diag_metrics, step=step)
 
         if (args.opt_state_log_every > 0
                 and step % args.opt_state_log_every == 0):
@@ -2289,6 +2361,12 @@ def run_step_training(
                     "val/ppl": val_metrics["ppl"],
                     "val/n_skipped": val_metrics.get("n_skipped", 0),
                 }
+                # Train-val gap on the smoothed LM loss (``running_avg`` is the
+                # EMA of train/lm_loss). A widening gap flags overfitting; a
+                # large stuck gap with both high flags the streaming-replay /
+                # capacity plateau. NaN until the first log-every fires.
+                if math.isfinite(running_avg) and val_metrics["loss"] != float("inf"):
+                    eval_log["val/train_gap"] = val_metrics["loss"] - running_avg
                 if ema_val_metrics is not None:
                     eval_log["ema_val/loss"] = ema_val_metrics["loss"]
                     eval_log["ema_val/ppl"] = ema_val_metrics["ppl"]

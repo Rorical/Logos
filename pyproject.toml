@@ -23,3 +23,8 @@ wandb = ["wandb>=0.18"]
 find-links = [
     "https://download.pytorch.org/whl/cu130",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

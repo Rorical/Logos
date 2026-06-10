@@ -521,7 +521,18 @@ def run_step_training_xla(
     # the resume position so the first save reflects total progress.
     consumed_resume = int(getattr(args, "stream_docs_consumed", 0) or 0)
     docs_consumed = consumed_resume
+    # One-shot resume marker so a run started from a checkpoint records where it
+    # picked up (step + corpus position) instead of silently continuing the
+    # x-axis. Logged once, before the first optimizer step.
+    if main and start_step > 0:
+        base.wandb_log({
+            "train/resumed_from_step": start_step,
+            "train/resumed_docs_consumed": docs_consumed,
+        }, step=start_step)
+    last_step_time_ms = float("nan")
+    last_train_avg_lm = float("nan")  # smoothed train LM loss for the val gap
     while step < total_steps:
+        step_t0 = time.time()
         bag_size = base.token_superposition_bag_size_for_step(args, step, total_steps)
         device_loader = device_loaders.get(bag_size)
         if device_loader is None:
@@ -601,6 +612,9 @@ def run_step_training_xla(
             outputs.get("indexer_loss"),
         )
         grad_norm_val = grad_norm.detach().cpu().item() if grad_norm is not None else None
+        # The loss reduction above forces a device->host sync, so it is the
+        # natural step barrier to measure compute time against.
+        last_step_time_ms = (time.time() - step_t0) * 1000.0
         running_loss += loss_val
         running_lm_loss += lm_loss_val
         running_aux_loss += aux_loss_val
@@ -619,6 +633,8 @@ def run_step_training_xla(
                 "train/indexer_loss": indexer_loss_val,
                 "train/ppl": math.exp(min(lm_loss_val, 20)),
                 "train/tokens_seen": tokens_seen,
+                "train/docs_consumed": docs_consumed,
+                "train/step_time_ms": last_step_time_ms,
                 "train/tst_bag_size": bag_size,
                 "train/tst_phase": 1 if bag_size > 1 else 2,
             }
@@ -637,6 +653,7 @@ def run_step_training_xla(
             avg = running_loss / running_count
             avg_lm = running_lm_loss / running_count
             avg_aux = running_aux_loss / running_count
+            last_train_avg_lm = avg_lm  # carried into the val gap at eval time
             ppl = math.exp(min(avg_lm, 20))
             elapsed = time.time() - t0
             tokens_this_run = (
@@ -706,6 +723,12 @@ def run_step_training_xla(
                     "val/loss": val_metrics["loss"],
                     "val/ppl": val_metrics["ppl"],
                 }
+                # Train-val gap on the smoothed LM loss (NaN until first log).
+                if (math.isfinite(last_train_avg_lm)
+                        and val_metrics["loss"] != float("inf")):
+                    eval_log["val/train_gap"] = (
+                        val_metrics["loss"] - last_train_avg_lm
+                    )
                 if ema_val_metrics is not None:
                     eval_log["ema_val/loss"] = ema_val_metrics["loss"]
                     eval_log["ema_val/ppl"] = ema_val_metrics["ppl"]
