@@ -120,13 +120,24 @@ class HybridConfig(LinearConfig):
     hca_compression: int = 128
     compressed_query_dim: Optional[int] = None
     compressed_head_dim: Optional[int] = None
-    # Apply rotary position embedding to the CSA/HCA compressed-attention q/k
-    # (and the CSA indexer q/k). Queries rotate at their true token position;
-    # pooled keys rotate at a per-group representative position (the group's
-    # last token). Default ON, following NSA/DSA evidence that the indexer and
-    # compressed attention need positional geometry (a missing/mismatched
-    # indexer RoPE was a published DSA bug). Off => bit-identical to no-RoPE.
-    compressed_rope: bool = True
+    # Two independent, EXPERIMENTAL rotary paths over the compressed attention.
+    # Both default OFF: the NSA-endorsed scheme is positionless pooled keys
+    # (intra-block position comes from the TokenCompressor pos_bias plus the
+    # causal group masks), so turning either on departs from the published
+    # evidence and changes training behavior.
+    #
+    # compressed_rope: rotate the compressed-attention scoring q/k. Queries
+    #   rotate at their true token position; pooled keys at a per-group
+    #   representative position (the group's last token). NSA (2502.11089)
+    #   deliberately keeps COMPRESSED keys RoPE-free and ranks RoPE'd queries
+    #   against non-RoPE'd compressed keys, so this is an experiment, not the
+    #   evidence-backed default.
+    compressed_rope: bool = False
+    # indexer_rope: rotate the CSA indexer q/k. DSA / DeepSeek-V3.2's lightning
+    #   indexer applies partial RoPE, but it ranks RAW tokens, not pooled groups
+    #   — so rotating an indexer that scores pooled groups is unsupported by the
+    #   evidence and stays OFF by default.
+    indexer_rope: bool = False
 
     # Comma/semicolon-separated pattern, e.g. "hca,csa,csa,swa".
     # If unset, Hybrid preserves the old structural KDA/SWA schedule.
@@ -430,7 +441,9 @@ class CompressedGlobalAttention(nn.Module):
         # keys (rotated at a per-group representative position). Mirrors the
         # baseline Attention partial-rope geometry; default rotates the full
         # compressed head dim. Even-dim required by the rotate-half layout.
+        # EXPERIMENTAL and OFF by default — see HybridConfig.compressed_rope.
         self.compressed_rope = config.compressed_rope
+        self.indexer_rope = config.indexer_rope
         if self.compressed_rope:
             rope_dim = config.partial_rope_dim
             if rope_dim is None or rope_dim > self.head_dim:
@@ -453,8 +466,13 @@ class CompressedGlobalAttention(nn.Module):
             self.indexer_heads = config.csa_indexer_heads
             self.indexer_dim = config.csa_indexer_dim
             self.indexer_loss_weight = config.csa_indexer_loss_weight
-            if self.compressed_rope:
-                idx_rope_dim = min(self.rope_dim, self.indexer_dim)
+            if self.indexer_rope:
+                # Cap the indexer rope sub-dim by partial_rope_dim (when set) and
+                # the indexer head dim; independent of compressed_rope so either
+                # flag works alone.
+                idx_rope_dim = self.indexer_dim
+                if config.partial_rope_dim is not None:
+                    idx_rope_dim = min(idx_rope_dim, config.partial_rope_dim)
                 idx_rope_dim -= idx_rope_dim % 2
                 self.indexer_rope_dim = idx_rope_dim
                 if idx_rope_dim > 0:
@@ -534,7 +552,7 @@ class CompressedGlobalAttention(nn.Module):
             q_i = self.indexer_q_up(self.indexer_q_down(hidden.detach()))
             q_i = q_i.view(B, T, self.indexer_heads, self.indexer_dim)
             k_i = self.indexer_k_proj(kv_index.detach())
-            if self.compressed_rope and self.indexer_rope_dim > 0:
+            if self.indexer_rope and self.indexer_rope_dim > 0:
                 # Same positional geometry as the compressed attention so the
                 # indexer ranks blocks the way the dense attention would: rotate
                 # indexer-q at per-token positions, indexer-k at group positions.

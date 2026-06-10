@@ -203,10 +203,14 @@ class RotaryEmbedding(nn.Module):
         sequence axis), broadcast across batch/head dims. Used by compressed
         attention to rotate pooled keys at a per-group representative position
         rather than the dense ``0..seq_len`` grid. Indexing (not slicing) the
-        precomputed table keeps this torch.compile/XLA-safe; callers must clamp
-        positions into ``[0, max_seq_len)`` (no host-side bound check here so
-        the path stays free of data-dependent syncs).
+        precomputed table keeps this torch.compile/XLA-safe.
+
+        Positions are clamped into ``[0, max_seq_len)`` so an out-of-range index
+        can't silently wrap or fault the gather — the same guard ``forward()``
+        gives via its ``ValueError``, expressed as a clamp here to stay free of
+        the data-dependent host sync a bound check would force.
         """
+        positions = positions.clamp(0, self.max_seq_len - 1)
         # cos/sin are [1, 1, max_seq_len, dim]; gather the seq axis -> [L, dim].
         cos = self.cos[0, 0].to(x.device).index_select(0, positions)
         sin = self.sin[0, 0].to(x.device).index_select(0, positions)

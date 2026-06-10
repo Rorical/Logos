@@ -1011,6 +1011,7 @@ def build_model(args: argparse.Namespace, vocab_size: int):
             compressed_query_dim=args.compressed_query_dim,
             compressed_head_dim=args.compressed_head_dim,
             compressed_rope=args.compressed_rope,
+            indexer_rope=args.indexer_rope,
             attn_pattern=args.attn_pattern,
         )
     elif args.model == "recursive":
@@ -1043,6 +1044,7 @@ def build_model(args: argparse.Namespace, vocab_size: int):
             compressed_query_dim=args.compressed_query_dim,
             compressed_head_dim=args.compressed_head_dim,
             compressed_rope=args.compressed_rope,
+            indexer_rope=args.indexer_rope,
             attn_pattern=args.attn_pattern,
             entry_attn_pattern=args.entry_attn_pattern,
             body_attn_pattern=args.body_attn_pattern,
@@ -2770,12 +2772,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compressed-head-dim", type=int, default=None,
                         help="[hybrid,logos] Per-head CSA/HCA shared-KV dimension. Defaults to --head-dim.")
     parser.add_argument("--compressed-rope", action=argparse.BooleanOptionalAction,
-                        default=True,
-                        help="[hybrid,logos] Apply rotary position embedding to "
-                             "CSA/HCA compressed-attention q/k and the CSA indexer "
-                             "q/k (NSA/DSA: pooled keys rotate at their group's last "
-                             "token). --no-compressed-rope restores the old "
-                             "position-free compressed attention.")
+                        default=False,
+                        help="[hybrid,logos] EXPERIMENT, off by default: rotate "
+                             "CSA/HCA compressed-attention scoring q/k (q at token "
+                             "pos, pooled k at the group's last token). NSA "
+                             "(2502.11089) keeps COMPRESSED keys RoPE-free, so the "
+                             "default is the positionless (pos_bias + causal-mask) "
+                             "scheme.")
+    parser.add_argument("--indexer-rope", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="[hybrid,logos] EXPERIMENT, off by default: rotate the "
+                             "CSA indexer q/k. DSA/DeepSeek-V3.2's indexer uses RoPE "
+                             "but ranks RAW tokens, not pooled groups, so rotating a "
+                             "group-ranking indexer is unsupported by the evidence.")
     parser.add_argument("--attn-pattern", type=str, default=None,
                         help="[hybrid,logos] Comma/semicolon pattern over kda,swa,csa,hca. "
                              "For Logos, applies globally only when section-specific patterns are unset.")

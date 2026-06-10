@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from models.baseline import RotaryEmbedding
 from models.hybrid import CompressedGlobalAttention, HybridConfig
 
 
@@ -27,12 +28,64 @@ def _module(mode="csa", **overrides):
 
 
 class CompressedRopeTest(unittest.TestCase):
-    def test_flag_off_bit_identical_to_no_rope_construction(self):
-        # With the flag off, the new RoPE code is fully skipped: q/kv are scored
-        # un-rotated and the indexer keys/queries are un-rotated, so the forward
-        # must equal a module that has no rotary modules at all. We assert the
-        # two off-modules agree bit-for-bit on the same weights and that turning
-        # the flag on changes the result.
+    def test_defaults_off(self):
+        # Both rope paths are EXPERIMENTAL and must default off so plain
+        # training reproduces the pre-a052b99 (NSA-endorsed) position scheme.
+        cfg = HybridConfig(vocab_size=32, d_model=16, num_heads=2, head_dim=8,
+                           d_ff=32, num_layers=1, max_seq_len=64, use_moe=False)
+        self.assertFalse(cfg.compressed_rope)
+        self.assertFalse(cfg.indexer_rope)
+
+    def test_flag_off_executes_zero_rotary_calls(self):
+        # The most robust flag-off guard: with both flags off the rope code is
+        # not merely numerically inert, it never runs. Monkeypatch the only
+        # rotary entry point compressed attention uses and assert the counter
+        # stays at zero across a full forward (forward + backward through the
+        # indexer KL). A regression that wires rope unconditionally would bump
+        # this even if the numbers happened to match.
+        calls = {"n": 0}
+        orig = RotaryEmbedding.forward_at_positions
+
+        def counting(self, x, positions):
+            calls["n"] += 1
+            return orig(self, x, positions)
+
+        RotaryEmbedding.forward_at_positions = counting
+        try:
+            for mode in ("csa", "hca"):
+                with self.subTest(mode=mode):
+                    torch.manual_seed(0)
+                    m = _module(mode=mode, compressed_rope=False,
+                                indexer_rope=False)
+                    m.train()
+                    x = torch.randn(2, 24, 16)
+                    out, index_loss = m(x, is_causal=True)
+                    out.sum().backward()
+            self.assertEqual(calls["n"], 0,
+                             "flag-off forward must not invoke any RoPE")
+        finally:
+            RotaryEmbedding.forward_at_positions = orig
+
+    def test_flag_off_matches_inline_no_rope_reference(self):
+        # Golden check: a fixed-seed flag-off forward must equal a minimal
+        # inline reimplementation of the pre-change scoring path (un-rotated q
+        # and pooled kv), proving the off-path is bit-identical to "rope code
+        # entirely absent", not just to a different rope configuration.
+        for mode in ("csa", "hca"):
+            with self.subTest(mode=mode):
+                torch.manual_seed(0)
+                m = _module(mode=mode, compressed_rope=False,
+                            indexer_rope=False)
+                m.eval()
+                x = torch.randn(2, 24, 16)
+                out, _ = m(x, is_causal=True)
+
+                ref = _reference_no_rope_forward(m, x)
+                torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+    def test_flag_on_bit_differs_from_off(self):
+        # Turning a flag on must change the output relative to off (and the two
+        # off-modules agree on shared weights).
         for mode in ("csa", "hca"):
             with self.subTest(mode=mode):
                 torch.manual_seed(0)
@@ -56,12 +109,35 @@ class CompressedRopeTest(unittest.TestCase):
                 )
 
     def test_off_module_has_no_rotary_params(self):
-        m = _module(mode="csa", compressed_rope=False)
+        m = _module(mode="csa", compressed_rope=False, indexer_rope=False)
         self.assertFalse(hasattr(m, "rotary"))
         self.assertFalse(hasattr(m, "indexer_rotary"))
-        m2 = _module(mode="csa", compressed_rope=True)
+        m2 = _module(mode="csa", compressed_rope=True, indexer_rope=True)
         self.assertTrue(hasattr(m2, "rotary"))
         self.assertTrue(hasattr(m2, "indexer_rotary"))
+
+    def test_flags_are_independent(self):
+        # compressed_rope and indexer_rope gate separate modules; either works
+        # alone.
+        m_c = _module(mode="csa", compressed_rope=True, indexer_rope=False)
+        self.assertTrue(hasattr(m_c, "rotary"))
+        self.assertFalse(hasattr(m_c, "indexer_rotary"))
+        m_i = _module(mode="csa", compressed_rope=False, indexer_rope=True)
+        self.assertFalse(hasattr(m_i, "rotary"))
+        self.assertTrue(hasattr(m_i, "indexer_rotary"))
+        # indexer_rope alone still changes the output vs. fully off.
+        torch.manual_seed(0)
+        m_off = _module(mode="csa", compressed_rope=False, indexer_rope=False)
+        torch.manual_seed(0)
+        m_idx = _module(mode="csa", compressed_rope=False, indexer_rope=True)
+        m_idx.load_state_dict(m_off.state_dict())
+        m_off.train()
+        m_idx.train()
+        x = torch.randn(2, 24, 16)
+        out_off, _ = m_off(x, is_causal=True)
+        out_idx, _ = m_idx(x, is_causal=True)
+        # Indexer rope reshapes top-k selection, so the attention output moves.
+        self.assertGreater((out_idx - out_off).abs().max().item(), 1e-6)
 
     def test_flag_on_no_nan_and_finite(self):
         for mode in ("csa", "hca"):
@@ -143,13 +219,45 @@ class CompressedRopeTest(unittest.TestCase):
     def test_indexer_rope_only_when_dim_positive(self):
         # If the indexer head dim rounds the rope sub-dim to 0, the indexer rope
         # is skipped but compressed-attention rope still applies.
-        m = _module(mode="csa", compressed_rope=True, csa_indexer_dim=1)
+        m = _module(mode="csa", compressed_rope=True, indexer_rope=True,
+                    csa_indexer_dim=1)
         self.assertEqual(m.indexer_rope_dim, 0)
         self.assertFalse(hasattr(m, "indexer_rotary"))
         m.eval()
         x = torch.randn(2, 24, 16)
         out, _ = m(x, is_causal=True)
         self.assertFalse(torch.isnan(out).any())
+
+
+def _reference_no_rope_forward(m, x):
+    """Minimal inline reimplementation of the pre-a052b99 forward (no RoPE).
+
+    Reproduces compress -> norm -> q-project -> un-rotated scores -> softmax ->
+    value aggregation, calling the module's own ``_build_scores`` (whose indexer
+    rope branch is gated off) so the only thing this skips is the rope wiring in
+    ``forward``. Used to prove the flag-off output equals "rope code absent".
+    """
+    import torch.nn.functional as F
+
+    B, T, _ = x.shape
+    kv, group_valid = m.compressor(x, None)
+    kv = m.kv_norm(kv)
+    q = m.q_up(m.q_down(x)).view(B, T, m.num_heads, m.head_dim)
+    q = m.q_norm(q).transpose(1, 2)
+    positions = m._group_positions(kv.size(1), T, x.device)
+    scores, _ = m._build_scores(q, kv, kv, group_valid, None, True, x, positions)
+    all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
+    if m.attention_sink:
+        sink = m.sink_logit.float().view(1, m.num_heads, 1, 1).expand(B, -1, T, -1)
+        aug = torch.cat([scores.float(), sink], dim=-1)
+        weights = F.softmax(aug, dim=-1)[..., :scores.size(-1)].to(kv.dtype)
+    else:
+        safe_scores = torch.where(all_masked, torch.zeros_like(scores), scores)
+        weights = F.softmax(safe_scores.float(), dim=-1).to(kv.dtype)
+        weights = torch.where(all_masked, torch.zeros_like(weights), weights)
+    out = torch.einsum("bhtn,bnd->bhtd", weights, kv)
+    out = out.transpose(1, 2).reshape(B, T, m.num_heads * m.head_dim)
+    return m.out_proj(out)
 
 
 if __name__ == "__main__":
