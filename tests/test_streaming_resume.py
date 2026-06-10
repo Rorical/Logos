@@ -560,6 +560,54 @@ class XlaStreamingLoaderTest(unittest.TestCase):
         self.assertNotIn("source_idx", next(iter(val_loader)))
         self.assertIsNone(phase1, "TST disabled => no phase-1 loader")
 
+    def _xla_build(self, texts, num_shards=1, stream_state=None,
+                   **arg_overrides):
+        arg_overrides.setdefault("num_workers", 0)
+        args = _make_args(max_length=8, batch_size=2, val_docs=4,
+                          token_superposition_bag_size=1,
+                          token_superposition_ratio=0.0, **arg_overrides)
+        args.stream_state = stream_state
+        with mock.patch.object(
+            train_xla, "load_dataset",
+            side_effect=lambda **kw: _iterable(texts, num_shards=num_shards),
+        ):
+            return train_xla._build_streaming_loaders_xla(
+                args, _CharTokenizer(), _FakeXm(), rank=0, world_size=1,
+            )
+
+    def test_xla_train_loader_is_single_process_for_state_capture(self):
+        # Like train.py: the XLA streaming train loader must run single-process
+        # so the live HF state_dict is capturable on this process at checkpoint
+        # time, even with --num-workers > 0. The val loader keeps the workers.
+        texts = _docs(40)
+        train_loader, val_loader, _ = self._xla_build(texts, num_workers=4)
+        self.assertEqual(train_loader.num_workers, 0,
+                         "XLA streaming train loader must be single-process")
+        self.assertEqual(val_loader.num_workers, 4,
+                         "val loader should still use --num-workers")
+
+    def test_xla_resume_via_captured_state_never_replays_consumed(self):
+        # The migrated XLA resume path on an 8-shard stream: build the train
+        # loader, consume some docs off its raw HF source, capture the live
+        # state via _capture_stream_state, rebuild with that state and confirm
+        # ZERO of the consumed docs are re-read (the skip-before-shuffle replay
+        # the migration eliminates).
+        texts = _docs(140)
+        train_loader, _, _ = self._xla_build(texts, num_shards=8,
+                                             stream_shuffle_buffer=20)
+        raw_run1 = train_loader.dataset.source
+        it = iter(raw_run1)
+        consumed = {next(it)["text"] for _ in range(40)}
+        state = train._capture_stream_state(train_loader)
+        self.assertIsNotNone(state)
+
+        resumed_loader, _, _ = self._xla_build(texts, num_shards=8,
+                                               stream_shuffle_buffer=20,
+                                               stream_state=state)
+        resumed = {s["text"] for s in resumed_loader.dataset.source}
+        self.assertEqual(consumed & resumed, set(),
+                         "XLA resume must never re-read a consumed doc")
+
     def test_xla_save_checkpoint_persists_and_reads_back(self):
         # save_checkpoint_xla writes via xm.save; on CPU xm.save == torch.save.
         model = torch.nn.Linear(4, 4)
@@ -577,12 +625,24 @@ class XlaStreamingLoaderTest(unittest.TestCase):
             save_dir = Path(d)
             save_dir.mkdir(parents=True, exist_ok=True)
             (save_dir / "config.json").write_text("{}")
+            # Capture a real HF state_dict so the round-trip exercises the new
+            # stream_state plumbing on the XLA checkpoint path.
+            texts = _docs(80)
+            args = _make_args(val_docs=4, stream_shuffle_buffer=20)
+            run1 = train.shuffle_train_stream(
+                args, _iterable(texts, num_shards=8).skip(args.val_docs),
+            )
+            it = iter(run1)
+            for _ in range(20):
+                next(it)
+            state = run1.state_dict()
             path = train_xla.save_checkpoint_xla(
                 _SaveXm(), model, optimizer, None,
                 epoch=7, metrics={"loss": 1.0}, save_dir=save_dir,
-                stream_docs_consumed=9999,
+                stream_docs_consumed=9999, stream_state=state,
             )
             self.assertEqual(train.read_stream_docs_consumed(path, cpu), 9999)
+            self.assertIsInstance(train.read_stream_state(path, cpu), dict)
 
 
 class ResolveResumePathTest(unittest.TestCase):

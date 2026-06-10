@@ -131,6 +131,7 @@ def save_checkpoint_xla(
     ema_model: Optional[AveragedModel] = None,
     keep_last_n: int = 0,
     stream_docs_consumed: Optional[int] = None,
+    stream_state: Optional[dict] = None,
 ):
     _safe_mkdir_main(xm, save_dir)
     inner = _model_for_state_dict(model)
@@ -140,10 +141,15 @@ def save_checkpoint_xla(
         "optimizer_state_dict": optimizer.state_dict(),
         "metrics": metrics,
     }
-    # Within-shard train-stream position for resumable streaming (None on the
-    # per-epoch path, which re-reads a finite dataset in full each epoch).
+    # Streaming train-stream position for resumable streaming. ``stream_state``
+    # is the HF IterableDataset state_dict and is the ACTUAL resume mechanism
+    # (read by base.read_stream_state); ``stream_docs_consumed`` is a
+    # human-readable diagnostic count. Both None on the per-epoch path, which
+    # re-reads a finite dataset in full each epoch.
     if stream_docs_consumed is not None:
         checkpoint["stream_docs_consumed"] = int(stream_docs_consumed)
+    if stream_state is not None:
+        checkpoint["stream_state"] = stream_state
     if scheduler is not None:
         checkpoint["scheduler_state_dict"] = scheduler.state_dict()
     if muon_hp is not None:
@@ -515,10 +521,11 @@ def run_step_training_xla(
         train_loaders[int(args.token_superposition_bag_size)] = phase1_train_loader
     device_loaders: Dict[int, Any] = {}
     train_iters: Dict[int, Any] = {}
-    # GLOBAL post-val corpus docs consumed (the unit that feeds back as
-    # .skip(stream_docs_consumed)). source_idx is a within-shard local index,
-    # so a per-replica count of K maps to ~K*world_size global docs. Seed from
-    # the resume position so the first save reflects total progress.
+    # GLOBAL post-val corpus docs consumed — a DIAGNOSTIC progress count now
+    # (resume is driven by the HF state_dict, not a doc-count .skip).
+    # source_idx is a within-shard local index, so a per-replica count of K
+    # maps to ~K*world_size global docs. Seed from the resume position so the
+    # first save reflects total progress.
     consumed_resume = int(getattr(args, "stream_docs_consumed", 0) or 0)
     docs_consumed = consumed_resume
     # Running max of within-shard source_idx, kept ON DEVICE so the per-step
@@ -528,10 +535,10 @@ def run_step_training_xla(
     src_idx_max_dev = torch.full((), -1, dtype=torch.long, device=device)
 
     def _materialize_docs_consumed() -> int:
-        # Host-sync the on-device source_idx max into the global doc-count unit
-        # that feeds back as .skip(stream_docs_consumed). source_idx is a
-        # within-shard local index, so a per-replica max of M maps to
-        # ~(M+1)*world_size global docs. Call ONLY at checkpoint time.
+        # Host-sync the on-device source_idx max into the diagnostic global
+        # doc-count. source_idx is a within-shard local index, so a per-replica
+        # max of M maps to ~(M+1)*world_size global docs. Call ONLY at
+        # checkpoint time.
         local_max = int(src_idx_max_dev.item())
         if local_max < 0:
             return docs_consumed
@@ -724,6 +731,15 @@ def run_step_training_xla(
                 and (save_due or (eval_due and not args.no_save))):
             docs_consumed = _materialize_docs_consumed()
 
+        # Capture the live HF stream position of the currently driving loader
+        # (phase-1 or phase-2 under TST) so resume continues from exactly here
+        # instead of replaying the stream head. Only the master iterates the
+        # train loader and writes checkpoints, so capture is gated on ``main``.
+        stream_state = (
+            base._capture_stream_state(train_loaders[bag_size])
+            if (main and args.streaming and (save_due or eval_due)) else None
+        )
+
         if eval_due:
             val_metrics = evaluate_xla(
                 xm, pl, raw_model, val_loader, device, use_amp, mp_dtype,
@@ -772,6 +788,7 @@ def run_step_training_xla(
                     muon_hp=muon_hp, ema_model=ema_model,
                     keep_last_n=args.keep_last_n,
                     stream_docs_consumed=docs_consumed if args.streaming else None,
+                    stream_state=stream_state,
                 )
         elif save_due:
             save_checkpoint_xla(
@@ -781,6 +798,7 @@ def run_step_training_xla(
                 muon_hp=muon_hp, ema_model=ema_model,
                 keep_last_n=args.keep_last_n,
                 stream_docs_consumed=docs_consumed if args.streaming else None,
+                stream_state=stream_state,
             )
 
         if (
@@ -807,12 +825,17 @@ def run_step_training_xla(
     # Final host-sync of the doc count for the final checkpoint (the loop only
     # materialized at save cadence, so the tail steps since the last save are
     # not yet reflected).
+    final_stream_state = None
     if args.streaming and main:
         docs_consumed = _materialize_docs_consumed()
+        # Training ends in phase 2 (standard NTP), so the standard train_loader
+        # is the right loader to capture for a resume from the final checkpoint.
+        final_stream_state = base._capture_stream_state(train_loader)
     return {
         "best_val_loss": best_val_loss,
         "history": history,
         "stream_docs_consumed": docs_consumed,
+        "stream_state": final_stream_state,
     }
 
 
@@ -964,25 +987,27 @@ def _build_streaming_loaders_xla(args, tokenizer, xm, rank: int, world_size: int
     if _xla_is_main(xm):
         print(f"  cached {len(val_docs_full)} docs for val")
 
-    # Pipeline: .skip(val_docs) -> .skip(consumed_global) -> .shuffle(seed)
-    # -> .shard(world_size, rank). Skip BEFORE shuffle (HF's .skip after a
-    # shuffle drops only one shard-block on a single-shard stream and would
-    # replay the prefix — see base.shuffle_train_stream). consumed_global is a
-    # GLOBAL post-val corpus-doc count, so every replica skips the same prefix
-    # and then shards the shuffled tail. Each replica's PackedStream enumerates
-    # its own shard, so source_idx reports a within-shard local index here
-    # (base_offset=0); the loop scales it back to a global count.
+    # Pipeline: .skip(val_docs) -> .shuffle(seed) -> .shard(world_size, rank).
+    # Resume is NOT a doc-count .skip: HF's .skip(n) on a multi-shard stream
+    # only drops up to one shard block, so a .skip(consumed) resume replays
+    # ~all consumed docs and re-creates the plateau (see
+    # base.shuffle_train_stream). Resume is instead driven by the HF
+    # state_dict loaded into the PackedStream (args.stream_state), which
+    # positions the post-shuffle/post-shard iterator exactly where it left off.
+    # The train loader pins num_workers=0 so this process's HF handle is the
+    # one that actually advances and can be captured at checkpoint time.
+    resume_state = getattr(args, "stream_state", None)
     consumed_global = int(getattr(args, "stream_docs_consumed", 0) or 0)
-    train_stream = load_dataset(**load_kwargs).skip(args.val_docs)
-    if consumed_global > 0:
-        train_stream = train_stream.skip(consumed_global)
-    train_stream = base.shuffle_train_stream(args, train_stream)
+    train_stream = base.shuffle_train_stream(
+        args, load_dataset(**load_kwargs).skip(args.val_docs),
+    )
     if world_size > 1:
         train_stream = train_stream.shard(num_shards=world_size, index=rank)
 
     train_ds = base.PackedStream(
         train_stream, tokenizer, args.max_length, text_key=args.text_column,
-        emit_source_idx=True,
+        base_offset=consumed_global, emit_source_idx=True,
+        resume_state=resume_state,
     )
     val_ds = base.PackedStream(
         val_docs_full, tokenizer, args.max_length, text_key=args.text_column,
@@ -1001,7 +1026,16 @@ def _build_streaming_loaders_xla(args, tokenizer, xm, rank: int, world_size: int
     if nw > 0:
         common_kw["persistent_workers"] = True
         common_kw["prefetch_factor"] = max(1, int(args.prefetch_factor))
-    train_loader = DataLoader(train_ds, **common_kw)
+    # The TRAIN loader runs single-process so the live HF state_dict is
+    # readable on THIS process at checkpoint time (worker processes would
+    # advance their own copies, leaving the main-process handle stuck at
+    # position 0). --num-workers still drives the val loader. Mirrors
+    # build_streaming_loaders in train.py.
+    train_kw = dict(common_kw)
+    train_kw["num_workers"] = 0
+    train_kw.pop("persistent_workers", None)
+    train_kw.pop("prefetch_factor", None)
+    train_loader = DataLoader(train_ds, **train_kw)
     val_loader = DataLoader(val_ds, drop_last=False, **common_kw)
     phase1_train_loader = None
     if base.token_superposition_enabled(args):
@@ -1011,19 +1045,19 @@ def _build_streaming_loaders_xla(args, tokenizer, xm, rank: int, world_size: int
                 "Building TST phase-1 streaming train loader with "
                 f"block_size={phase1_block_size}"
             )
-        train_stream_phase1 = load_dataset(**load_kwargs).skip(args.val_docs)
-        if consumed_global > 0:
-            train_stream_phase1 = train_stream_phase1.skip(consumed_global)
-        train_stream_phase1 = base.shuffle_train_stream(args, train_stream_phase1)
+        train_stream_phase1 = base.shuffle_train_stream(
+            args, load_dataset(**load_kwargs).skip(args.val_docs),
+        )
         if world_size > 1:
             train_stream_phase1 = train_stream_phase1.shard(
                 num_shards=world_size, index=rank,
             )
         phase1_ds = base.PackedStream(
             train_stream_phase1, tokenizer, phase1_block_size,
-            text_key=args.text_column, emit_source_idx=True,
+            text_key=args.text_column, base_offset=consumed_global,
+            emit_source_idx=True, resume_state=resume_state,
         )
-        phase1_train_loader = DataLoader(phase1_ds, **common_kw)
+        phase1_train_loader = DataLoader(phase1_ds, **train_kw)
     return train_loader, val_loader, phase1_train_loader
 
 
@@ -1109,19 +1143,33 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
                 "--streaming requires --total-steps N (N > 0) or --total-tokens"
             )
         # Resolve the resume stream position BEFORE building the loaders so the
-        # train pipeline becomes .skip(val_docs) -> .skip(consumed) -> .shuffle
-        # -> .shard. The full model/optimizer restore happens later.
+        # train PackedStream can load the checkpointed HF state_dict
+        # (args.stream_state) and continue from the exact iteration position.
+        # ``stream_docs_consumed`` is now only the diagnostic source_idx offset;
+        # resume is driven by the state_dict, NOT a .skip (HF .skip on a
+        # multi-shard stream replays ~all consumed docs — the plateau bug). The
+        # full model/optimizer restore happens later.
         args.stream_docs_consumed = 0
+        args.stream_state = None
         _resume_peek_path = base.resolve_resume_path(args.resume, save_dir)
         if _resume_peek_path is not None:
             args.stream_docs_consumed = base.read_stream_docs_consumed(
                 _resume_peek_path, torch.device("cpu"),
             )
-            if main_proc and args.stream_docs_consumed > 0:
+            args.stream_state = base.read_stream_state(
+                _resume_peek_path, torch.device("cpu"),
+            )
+            if main_proc and args.stream_state is not None:
                 print(
-                    "  Resuming stream at global doc "
-                    f"{args.stream_docs_consumed:,} (skip val_docs -> "
-                    f"skip {args.stream_docs_consumed:,} -> shuffle -> shard)"
+                    "  Resuming stream from checkpointed HF state_dict "
+                    f"(diagnostic doc offset {args.stream_docs_consumed:,}); "
+                    "zero stream-head replay"
+                )
+            elif main_proc and args.stream_docs_consumed > 0:
+                print(
+                    "  Resume checkpoint predates stream_state; stream "
+                    "restarts from the head (cannot exact-resume an old "
+                    "checkpoint)"
                 )
         train_loader, val_loader, phase1_train_loader = _build_streaming_loaders_xla(
             args, tokenizer, xm, rank=rank, world_size=world_size,
@@ -1263,6 +1311,7 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
         history = result["history"]
         best_val_loss = result["best_val_loss"]
         final_stream_docs_consumed = result.get("stream_docs_consumed")
+        final_stream_state = result.get("stream_state")
         val_metrics = (history[-1].get("val") if history
                        else {"loss": float("inf"), "ppl": float("inf")})
         if main_proc:
@@ -1294,21 +1343,23 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
         _xla_barrier(xm, "history-streaming")
 
         if not args.no_save:
-            final_path = save_final_xla(
-                xm,
-                {
-                    "step": total_steps,
-                    "model_state_dict": raw_model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-                    "muon_hp_state_dict": muon_hp.state_dict() if muon_hp else None,
-                    "ema_state_dict": ema_model.state_dict() if ema_model else None,
-                    "metrics": val_metrics,
-                    "history": history,
-                    "stream_docs_consumed": final_stream_docs_consumed,
-                },
-                save_dir,
-            )
+            final_payload: Dict[str, Any] = {
+                "step": total_steps,
+                "model_state_dict": raw_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+                "muon_hp_state_dict": muon_hp.state_dict() if muon_hp else None,
+                "ema_state_dict": ema_model.state_dict() if ema_model else None,
+                "metrics": val_metrics,
+                "history": history,
+                "stream_docs_consumed": final_stream_docs_consumed,
+            }
+            # checkpoint_final.pt is an explicit --resume target, so it must
+            # carry the HF state_dict like the periodic checkpoints — otherwise
+            # resuming from it restarts the stream at the head.
+            if final_stream_state is not None:
+                final_payload["stream_state"] = final_stream_state
+            final_path = save_final_xla(xm, final_payload, save_dir)
             if main_proc:
                 print(f"Final checkpoint saved to {final_path}")
         elif main_proc:

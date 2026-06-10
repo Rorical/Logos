@@ -244,12 +244,20 @@ def init_wandb(args: argparse.Namespace):
         if args.model != model_name:
             for k in only_args:
                 config.pop(k, None)
+    # Let a ``WANDB_MODE`` env var win over the ``--wandb-mode`` default so the
+    # notebooks' offline fallback (set when the Colab WANDB_API_KEY secret is
+    # missing) actually takes effect. wandb gives an explicit ``init(mode=...)``
+    # kwarg precedence over the env var, so passing ``args.wandb_mode``
+    # unconditionally would silently override that fallback and block on an
+    # interactive login with no key.
+    import os
+    mode = os.environ.get("WANDB_MODE", args.wandb_mode)
     run = wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
         name=args.wandb_run_name,
         tags=args.wandb_tags,
-        mode=args.wandb_mode,
+        mode=mode,
         config=config,
     )
     return run
@@ -2150,11 +2158,10 @@ def run_step_training(
             grad_norm, per_group_grad_norms = clip_grads_per_group(
                 optimizer, grad_clip,
             )
-            # Count steps where the (combined, pre-clip) norm exceeded the
-            # budget so the activation rate (events / step) is plottable — a
-            # clip that fires every step silently caps the effective LR.
-            if grad_norm is not None and grad_norm.detach().item() > grad_clip:
-                grad_clip_events += 1
+            # The clip-event count (steps where the pre-clip norm exceeded the
+            # budget) is bumped AFTER the batched device->host sync below using
+            # ``grad_norm_val`` — adding an early ``grad_norm.item()`` here would
+            # force a second per-step sync and defeat the single-sync design.
         else:
             grad_norm, per_group_grad_norms = None, []
 
@@ -2241,6 +2248,12 @@ def run_step_training(
             indexer_loss_val = scalars[3]
             grad_norm_val = scalars[4]
             per_group_grad_norm_vals = scalars[5:]
+            # Count steps where the (combined, pre-clip) norm exceeded the
+            # budget so the activation rate (events / step) is plottable — a
+            # clip that fires every step silently caps the effective LR. Reuses
+            # the value from the single batched sync above (no extra stall).
+            if grad_norm_val > grad_clip:
+                grad_clip_events += 1
         else:
             scalars = torch.cat(
                 [loss_d, lm_loss_d, aux_loss_d, indexer_loss_d]
@@ -3416,6 +3429,7 @@ def main(args: Optional[argparse.Namespace] = None):
         history = result["history"]
         best_val_loss = result["best_val_loss"]
         final_stream_docs_consumed = result.get("stream_docs_consumed")
+        final_stream_state = result.get("stream_state")
         val_metrics = (history[-1].get("val") if history
                        else {"loss": float("inf"), "ppl": float("inf")})
         train_metrics = val_metrics  # streaming path doesn't track per-epoch train metrics
@@ -3449,7 +3463,7 @@ def main(args: Optional[argparse.Namespace] = None):
 
             if not args.no_save:
                 final_path = save_dir / "checkpoint_final.pt"
-                torch.save({
+                final_payload = {
                     "step": total_steps,
                     "model_state_dict": raw_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -3459,7 +3473,16 @@ def main(args: Optional[argparse.Namespace] = None):
                     "metrics": val_metrics,
                     "history": history,
                     "stream_docs_consumed": final_stream_docs_consumed,
-                }, final_path)
+                }
+                # ``checkpoint_final.pt`` is an explicit ``--resume`` target, so
+                # it must carry the HF ``state_dict`` like the periodic
+                # ``checkpoint_epoch_*.pt`` files — otherwise resuming from the
+                # final checkpoint restarts the stream at the head (the exact
+                # replay this plateau fix eliminates). ``read_stream_state``
+                # reads this key.
+                if final_stream_state is not None:
+                    final_payload["stream_state"] = final_stream_state
+                torch.save(final_payload, final_path)
                 print(f"Final checkpoint saved to {final_path}")
             else:
                 print("(--no-save active: no model weights written)")
