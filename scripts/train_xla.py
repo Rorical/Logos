@@ -521,6 +521,21 @@ def run_step_training_xla(
     # the resume position so the first save reflects total progress.
     consumed_resume = int(getattr(args, "stream_docs_consumed", 0) or 0)
     docs_consumed = consumed_resume
+    # Running max of within-shard source_idx, kept ON DEVICE so the per-step
+    # update is a fused ``torch.maximum`` that never forces a device->host sync
+    # before the forward graph builds. Materialized to host only when a
+    # checkpoint is about to be written (see ``_materialize_docs_consumed``).
+    src_idx_max_dev = torch.full((), -1, dtype=torch.long, device=device)
+
+    def _materialize_docs_consumed() -> int:
+        # Host-sync the on-device source_idx max into the global doc-count unit
+        # that feeds back as .skip(stream_docs_consumed). source_idx is a
+        # within-shard local index, so a per-replica max of M maps to
+        # ~(M+1)*world_size global docs. Call ONLY at checkpoint time.
+        local_max = int(src_idx_max_dev.item())
+        if local_max < 0:
+            return docs_consumed
+        return max(docs_consumed, consumed_resume + (local_max + 1) * world_size)
     # One-shot resume marker so a run started from a checkpoint records where it
     # picked up (step + corpus position) instead of silently continuing the
     # x-axis. Logged once, before the first optimizer step.
@@ -561,16 +576,19 @@ def run_step_training_xla(
 
         # Pop source_idx OUT of the batch before the model sees it (the
         # MpDeviceLoader already moved it to the XLA device, so popping here
-        # also keeps it out of the graph). Track the within-shard consumed-doc
-        # count on the main replica; replicas advance in lockstep so rank-0's
-        # count is a good resume offset for all. A few docs near the boundary
+        # also keeps it out of the graph). Fold its max into the on-device
+        # running max with ``torch.maximum`` — this stays on the XLA device, so
+        # it does NOT force a device->host sync at the top of the step (the old
+        # ``int(batch_source_idx.max())`` here serialised every step before the
+        # forward graph could build). The host read is deferred to checkpoint
+        # time via ``_materialize_docs_consumed``. Replicas advance in lockstep
+        # so rank-0's count is a good resume offset for all; a few boundary docs
         # may re-appear once after a restart under multi-worker prefetch —
         # acceptable; systematic stream-head replay is what this kills.
         batch_source_idx = batch.pop("source_idx", None)
         if batch_source_idx is not None and main:
-            within_shard = int(batch_source_idx.max()) + 1
-            docs_consumed = max(
-                docs_consumed, consumed_resume + within_shard * world_size,
+            src_idx_max_dev = torch.maximum(
+                src_idx_max_dev, batch_source_idx.max(),
             )
 
         ids = batch["input_ids"]
@@ -696,6 +714,16 @@ def run_step_training_xla(
             and step % args.save_every == 0
         )
 
+        # Materialize the on-device source_idx max into ``docs_consumed`` only
+        # when a checkpoint is about to be written (eval saves too, unless
+        # --no-save). This is the ONLY per-step device->host sync for the doc
+        # count, and it runs at checkpoint cadence rather than every step. Only
+        # the master tracks src_idx_max_dev and writes checkpoints, so gate the
+        # sync on ``main`` to avoid serialising the other replicas needlessly.
+        if (main and args.streaming
+                and (save_due or (eval_due and not args.no_save))):
+            docs_consumed = _materialize_docs_consumed()
+
         if eval_due:
             val_metrics = evaluate_xla(
                 xm, pl, raw_model, val_loader, device, use_amp, mp_dtype,
@@ -776,6 +804,11 @@ def run_step_training_xla(
     if main:
         pbar.close()
         print(f"\n=== Training complete in {(time.time() - t0) / 60:.1f} min ===")
+    # Final host-sync of the doc count for the final checkpoint (the loop only
+    # materialized at save cadence, so the tail steps since the last save are
+    # not yet reflected).
+    if args.streaming and main:
+        docs_consumed = _materialize_docs_consumed()
     return {
         "best_val_loss": best_val_loss,
         "history": history,

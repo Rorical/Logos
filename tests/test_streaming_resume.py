@@ -1,18 +1,27 @@
 """CPU, network-free tests for streaming-data shuffle + resumable position.
 
-Covers Fix 1 ("shuffle streaming data and checkpoint stream position"):
+Covers Fix 1 ("shuffle streaming data and checkpoint stream position") and its
+hardening ("harden streaming resume against shard shuffling and worker skew"):
   (a) shuffle reorders docs but preserves the multiset, and the val
       hold-out (first val_docs) stays fixed and unshuffled;
   (b) PackedStream emits the correct GLOBAL source_idx with base_offset,
       under a single worker and under 2 simulated workers;
-  (c) resume math: consuming N docs then rebuilding skip(N) with the same
-      seed continues with (nearly) disjoint documents;
-  (d) checkpoint round-trip: stream_docs_consumed survives save/load.
+  (c) MULTI-SHARD resume (the hardening): consuming N docs then resuming via
+      the HF ``state_dict`` re-reads ZERO consumed docs and loses at most a
+      shuffle-buffer worth — measured on an 8-shard stream where the OLD
+      ``.skip(N)``-before-``.shuffle`` resume replayed most of the prefix
+      because ``.shuffle`` also shuffles shard order;
+  (d) checkpoint round-trip: stream_docs_consumed AND stream_state survive
+      save/load, and a corrupt checkpoint falls back cleanly;
+  (e) TST phase-1 -> phase-2 in-process handoff continues the stream instead
+      of replaying phase 1's docs.
 """
 
 import argparse
+import pickle
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -56,8 +65,10 @@ def _docs(n, prefix="doc"):
     return [f"{prefix}{i:04d}-" + "x" * 16 for i in range(n)]
 
 
-def _iterable(texts):
-    return datasets.Dataset.from_dict({"text": texts}).to_iterable_dataset()
+def _iterable(texts, num_shards=1):
+    return datasets.Dataset.from_dict({"text": texts}).to_iterable_dataset(
+        num_shards=num_shards,
+    )
 
 
 class ShuffleTest(unittest.TestCase):
@@ -150,46 +161,119 @@ class PackedStreamSourceIdxTest(unittest.TestCase):
         self.assertTrue(all((i - base_offset) % 2 == 1 for i in w1))
 
 
-class ResumeMathTest(unittest.TestCase):
-    def test_skip_before_shuffle_drops_exactly_n(self):
-        # The fix deviates from a naive shuffle-then-skip: on a single-shard
-        # iterable, HF's .skip(n) AFTER .shuffle drops only one shard-block, so
-        # resume would replay the prefix. .skip(n) BEFORE .shuffle drops
-        # exactly n docs and shuffles the remaining tail.
-        texts = _docs(60)
-        args = _make_args(stream_shuffle_buffer=60)
-        n = 20
+def _pipeline(texts, args, num_shards):
+    """The real train-stream pipeline: .skip(val_docs) -> .shuffle(seed,buf).
 
-        resumed = [
-            s["text"]
-            for s in train.shuffle_train_stream(args, _iterable(texts).skip(n))
-        ]
-        self.assertEqual(len(resumed), len(texts) - n,
-                         "skip-before-shuffle must drop exactly n docs")
-        self.assertEqual(set(resumed), set(texts[n:]),
-                         "resumed multiset must be exactly the unread tail")
-        self.assertTrue(set(resumed).isdisjoint(set(texts[:n])),
-                        "resumed docs must not replay the consumed prefix")
+    Mirrors ``build_streaming_loaders`` (skip the val hold-out, then shuffle —
+    which on a multi-shard stream ALSO shuffles shard order). Returns the raw HF
+    IterableDataset so a test can drive it and capture/load its ``state_dict``.
+    """
+    stream = _iterable(texts, num_shards=num_shards).skip(args.val_docs)
+    return train.shuffle_train_stream(args, stream)
 
-    def test_shuffle_train_stream_applies_resume_skip_then_shuffle(self):
-        # _shuffle_train_stream is the single-process train pipeline applied
-        # after .skip(val_docs): it composes .skip(consumed) then .shuffle.
-        texts = _docs(40)
-        args0 = _make_args(stream_shuffle_buffer=40, stream_docs_consumed=0)
-        args_resumed = _make_args(stream_shuffle_buffer=40, stream_docs_consumed=15)
 
-        fresh = [s["text"] for s in train._shuffle_train_stream(args0, _iterable(texts))]
-        resumed = [
-            s["text"]
-            for s in train._shuffle_train_stream(args_resumed, _iterable(texts))
-        ]
-        # A fresh run shuffles all docs; a resumed run skips the first 15
-        # CORPUS docs (the consumed count tracked via source_idx) and shuffles
-        # the rest, so resumed is exactly the corpus tail and never re-reads a
-        # consumed corpus doc.
-        self.assertEqual(set(fresh), set(texts))
-        self.assertEqual(set(resumed), set(texts[15:]))
-        self.assertTrue(set(resumed).isdisjoint(set(texts[:15])))
+class MultiShardResumeTest(unittest.TestCase):
+    """Pins the hardening property on a realistic 8-shard stream.
+
+    HF ``.shuffle`` shuffles SHARD ORDER as well as rows, so the pipeline order
+    on 8 shards is NOT the corpus order. The OLD resume — ``.skip(consumed)``
+    before ``.shuffle`` — therefore dropped a corpus-order prefix while run 1
+    had consumed a shuffled-shard-order prefix, making the two sets near
+    disjoint (huge replay). The fix resumes via the HF ``state_dict`` instead.
+    """
+
+    SHARDS = 8
+    VAL = 4
+    BUF = 20
+    CONSUME = 40
+
+    def test_old_skip_resume_replays_most_of_prefix_on_8_shards(self):
+        # Demonstrates the bug the hardening fixes: skip-before-shuffle resume
+        # on 8 shards replays a large fraction of consumed docs (NOT a small
+        # buffer-bounded overlap), because shard-order shuffling makes the
+        # skipped corpus prefix disjoint from the consumed shuffled prefix.
+        texts = _docs(140)
+        args = _make_args(val_docs=self.VAL, stream_shuffle_buffer=self.BUF)
+        run1 = _pipeline(texts, args, self.SHARDS)
+        it = iter(run1)
+        consumed = {next(it)["text"] for _ in range(self.CONSUME)}
+        resumed_old = {
+            s["text"] for s in train.shuffle_train_stream(
+                args, _iterable(texts, num_shards=self.SHARDS)
+                .skip(args.val_docs).skip(self.CONSUME),
+            )
+        }
+        replay = consumed & resumed_old
+        # The OLD mechanism replays a large fraction of the consumed docs —
+        # far more than the shuffle buffer. This is the defeated-plateau-fix
+        # failure mode; asserted here so the regression can't silently return.
+        self.assertGreater(
+            len(replay), self.BUF,
+            "skip-before-shuffle on multi-shard should replay >> buffer "
+            "(this is the bug the state_dict resume replaces)",
+        )
+
+    def test_state_dict_resume_zero_replay_bounded_loss_on_8_shards(self):
+        # The fix: capture the HF state_dict after consuming CONSUME docs, then
+        # resume a fresh same-seed pipeline via load_state_dict. Measured:
+        #   REPLAY == 0 (never re-reads a consumed doc), and
+        #   LOST   <= shuffle buffer (only the in-flight buffer is dropped),
+        # i.e. never replays consumed docs and never skips a large unread region.
+        texts = _docs(140)
+        args = _make_args(val_docs=self.VAL, stream_shuffle_buffer=self.BUF)
+        universe = set(texts[self.VAL:])
+
+        run1 = _pipeline(texts, args, self.SHARDS)
+        it = iter(run1)
+        consumed = {next(it)["text"] for _ in range(self.CONSUME)}
+        state = run1.state_dict()
+
+        resumed_stream = _pipeline(texts, args, self.SHARDS)
+        resumed_stream.load_state_dict(state)
+        resumed = {s["text"] for s in resumed_stream}
+
+        replay = consumed & resumed
+        lost = universe - consumed - resumed
+        self.assertEqual(len(replay), 0,
+                         "state_dict resume must never re-read a consumed doc")
+        self.assertLessEqual(
+            len(lost), self.BUF,
+            "loss must be bounded by the shuffle buffer (in-flight docs), "
+            "never a large unread region",
+        )
+
+    def test_packed_stream_capture_restore_plumbing_on_8_shards(self):
+        # The production capture/restore path on 8 shards: PackedStream exposes
+        # the live HF state_dict via ``hf_state_dict`` (what _capture_stream_state
+        # reads) and a fresh PackedStream built with ``resume_state`` loads it
+        # and yields only never-consumed corpus docs (a subset of the universe).
+        texts = _docs(140)
+        args = _make_args(val_docs=self.VAL, stream_shuffle_buffer=self.BUF)
+        universe = set(texts[self.VAL:])
+
+        ps = train.PackedStream(
+            _pipeline(texts, args, self.SHARDS), _CharTokenizer(),
+            block_size=8, emit_source_idx=True,
+        )
+        it = iter(ps)
+        for _ in range(30):
+            next(it)
+        state = ps.hf_state_dict()
+        self.assertIsNotNone(state)
+
+        resumed = train.PackedStream(
+            _pipeline(texts, args, self.SHARDS), _CharTokenizer(),
+            block_size=8, emit_source_idx=True, resume_state=state,
+        )
+        # Recover the source texts the resumed stream yields by reading them off
+        # its (loaded) HF source after a fresh build with the same state.
+        resumed_raw = _pipeline(texts, args, self.SHARDS)
+        resumed_raw.load_state_dict(state)
+        resumed_docs = {s["text"] for s in resumed_raw}
+        self.assertTrue(resumed_docs.issubset(universe))
+        self.assertGreater(len(resumed_docs), 0)
+        # The resumed PackedStream is iterable and emits source_idx.
+        self.assertIn("source_idx", next(iter(resumed)))
 
     def test_packed_stream_source_idx_round_trips_to_consumed(self):
         # End-to-end resume math through PackedStream: base_offset=consumed,
@@ -252,15 +336,95 @@ class CheckpointRoundTripTest(unittest.TestCase):
             )
             self.assertEqual(train.read_stream_docs_consumed(path, cpu), 0)
 
+    def test_stream_state_survives_save_load(self):
+        # The HF state_dict is the actual resume mechanism: it must round-trip
+        # through save_checkpoint / read_stream_state, and a real captured state
+        # must resume the same-seed stream without replay after the round-trip.
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        cpu = torch.device("cpu")
+
+        texts = _docs(80)
+        args = _make_args(val_docs=4, stream_shuffle_buffer=20)
+        run1 = train.shuffle_train_stream(
+            args, _iterable(texts, num_shards=8).skip(args.val_docs),
+        )
+        it = iter(run1)
+        consumed = {next(it)["text"] for _ in range(20)}
+        state = run1.state_dict()
+
+        with tempfile.TemporaryDirectory() as d:
+            save_dir = Path(d)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            (save_dir / "config.json").write_text("{}")
+            path = train.save_checkpoint(
+                model, optimizer, scheduler=None,
+                epoch=5, metrics={"loss": 1.0}, save_dir=save_dir,
+                stream_docs_consumed=20, stream_state=state,
+            )
+            loaded = train.read_stream_state(path, cpu)
+            self.assertIsInstance(loaded, dict)
+
+            resumed_stream = train.shuffle_train_stream(
+                args, _iterable(texts, num_shards=8).skip(args.val_docs),
+            )
+            resumed_stream.load_state_dict(loaded)
+            resumed = {s["text"] for s in resumed_stream}
+            self.assertEqual(consumed & resumed, set(),
+                             "round-tripped state must resume without replay")
+
+    def test_read_stream_state_defaults_none(self):
+        # Old checkpoints (no stream_state) -> None so the run starts fresh.
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        cpu = torch.device("cpu")
+        with tempfile.TemporaryDirectory() as d:
+            save_dir = Path(d)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            (save_dir / "config.json").write_text("{}")
+            path = train.save_checkpoint(
+                model, optimizer, scheduler=None,
+                epoch=1, metrics={"loss": 1.0}, save_dir=save_dir,
+                stream_state=None,
+            )
+            self.assertIsNone(train.read_stream_state(path, cpu))
+
+    def test_corrupt_checkpoint_falls_back_consistently(self):
+        # A truncated/half-written checkpoint must not crash the resume peek:
+        # the broader exception set (pickle.UnpicklingError, EOFError,
+        # zipfile.BadZipFile, OSError, RuntimeError) all fall back to 0 / None.
+        cpu = torch.device("cpu")
+        with tempfile.TemporaryDirectory() as d:
+            # Empty file -> EOFError/UnpicklingError depending on torch path.
+            empty = Path(d) / "empty.pt"
+            empty.write_bytes(b"")
+            self.assertEqual(train.read_stream_docs_consumed(empty, cpu), 0)
+            self.assertIsNone(train.read_stream_state(empty, cpu))
+
+            # Garbage bytes -> BadZipFile / UnpicklingError.
+            garbage = Path(d) / "garbage.pt"
+            garbage.write_bytes(b"not a torch checkpoint at all")
+            self.assertEqual(train.read_stream_docs_consumed(garbage, cpu), 0)
+            self.assertIsNone(train.read_stream_state(garbage, cpu))
+
+    def test_corrupt_ckpt_error_set_covers_required_types(self):
+        # The fix requires these specific exception types in the fallback set.
+        for exc in (pickle.UnpicklingError, EOFError, zipfile.BadZipFile,
+                    OSError, RuntimeError):
+            self.assertTrue(issubclass(exc, train._CORRUPT_CKPT_ERRORS))
+
 
 class BuildStreamingLoadersIntegrationTest(unittest.TestCase):
-    def _build(self, texts, **arg_overrides):
-        args = _make_args(max_length=8, batch_size=2, num_workers=0,
-                          val_docs=4, **arg_overrides)
+    def _build(self, texts, num_shards=1, stream_state=None, **arg_overrides):
+        arg_overrides.setdefault("num_workers", 0)
+        args = _make_args(max_length=8, batch_size=2, val_docs=4,
+                          **arg_overrides)
+        args.stream_state = stream_state
         # load_dataset is called once for val (full stream) and once for the
         # train stream; both must return a FRESH iterable.
         with mock.patch.object(
-            train, "load_dataset", side_effect=lambda **kw: _iterable(texts),
+            train, "load_dataset",
+            side_effect=lambda **kw: _iterable(texts, num_shards=num_shards),
         ):
             return train.build_streaming_loaders(args, _CharTokenizer())
 
@@ -277,33 +441,93 @@ class BuildStreamingLoadersIntegrationTest(unittest.TestCase):
         self.assertNotIn("source_idx", val_batch,
                          "eval path must never see source_idx")
 
-    def test_loop_pop_tracks_consumed_and_resume_is_disjoint(self):
-        # Mirror the run_step_training pop: read a few train batches, pop
-        # source_idx, track docs_consumed = max(source_idx)+1. Then rebuild
-        # with stream_docs_consumed = that count and confirm the resumed train
-        # stream never re-reads a consumed corpus doc.
+    def test_train_loader_is_single_process_for_state_capture(self):
+        # The streaming TRAIN loader must run single-process so the live HF
+        # state_dict is readable on this process at checkpoint time (see
+        # PackedStream / _capture_stream_state). Even with --num-workers > 0
+        # the train loader pins num_workers=0.
         texts = _docs(40)
-        train_loader, _ = self._build(texts)
+        train_loader, _ = self._build(texts, num_workers=4)
+        self.assertEqual(train_loader.num_workers, 0,
+                         "streaming train loader must be single-process")
 
-        docs_consumed = 0
-        seen_texts = set()
-        it = iter(train_loader)
-        tok = _CharTokenizer()
-        for _ in range(3):
-            batch = next(it)
-            src = batch.pop("source_idx")
-            docs_consumed = max(docs_consumed, int(src.max()) + 1)
-            # Recover which corpus docs the packed ids came from is awkward;
-            # instead assert the bookkeeping count is a sane corpus offset.
-        self.assertGreater(docs_consumed, 0)
-        self.assertLessEqual(docs_consumed, len(texts))
+    def test_resume_via_captured_state_never_replays_consumed(self):
+        # The production resume path on an 8-shard stream: build the train
+        # loader, consume a few batches, capture the live state via
+        # _capture_stream_state (what run_step_training saves), then rebuild
+        # with that state and confirm the resumed stream re-reads ZERO of the
+        # docs the first run consumed.
+        texts = _docs(140)
+        train_loader, _ = self._build(texts, num_shards=8,
+                                      stream_shuffle_buffer=20)
 
-        # Resume: skip the consumed corpus docs (past the val hold-out).
-        resumed_loader, _ = self._build(texts, stream_docs_consumed=docs_consumed)
-        # The resumed train stream's first source_idx must be >= docs_consumed,
-        # i.e. it starts past everything the first run consumed.
-        rbatch = next(iter(resumed_loader))
-        self.assertGreaterEqual(int(rbatch["source_idx"].min()), docs_consumed)
+        # Identify which docs run 1 consumed by reading the raw HF source the
+        # loader's PackedStream wraps (post-skip, post-shuffle order).
+        raw_run1 = train_loader.dataset.source
+        it = iter(raw_run1)
+        consumed = {next(it)["text"] for _ in range(40)}
+        state = train._capture_stream_state(train_loader)
+        self.assertIsNotNone(state)
+
+        resumed_loader, _ = self._build(texts, num_shards=8,
+                                        stream_shuffle_buffer=20,
+                                        stream_state=state)
+        resumed_raw = resumed_loader.dataset.source
+        resumed = {s["text"] for s in resumed_raw}
+        self.assertEqual(consumed & resumed, set(),
+                         "resume must never re-read a consumed doc")
+
+
+class TstPhaseHandoffTest(unittest.TestCase):
+    """Fix 4: the in-process TST phase-1 -> phase-2 handoff must continue the
+    stream, not replay phase 1's docs. Both phases build IDENTICAL same-seed
+    pipelines, so without the handoff phase 2 re-reads everything phase 1 saw.
+    """
+
+    def _train_loader(self, texts, block_size, num_shards):
+        args = _make_args(max_length=block_size, batch_size=2, num_workers=0,
+                          val_docs=4, stream_shuffle_buffer=20)
+        args.stream_state = None
+        with mock.patch.object(
+            train, "load_dataset",
+            side_effect=lambda **kw: _iterable(texts, num_shards=num_shards),
+        ):
+            return train.build_streaming_train_loader(args, _CharTokenizer(),
+                                                      block_size)
+
+    def test_build_streaming_train_loader_is_single_process(self):
+        # Phase-1 loader must also be single-process so its live HF state can be
+        # captured for the handoff into phase 2.
+        loader = self._train_loader(_docs(40), block_size=8, num_shards=1)
+        self.assertEqual(loader.num_workers, 0)
+        self.assertIsNotNone(train._capture_stream_state(loader),
+                             "phase-1 loader must expose a capturable HF state")
+
+    def test_handoff_continues_stream_no_replay(self):
+        # Simulate the loop's handoff: phase-1 loader consumes some docs; we
+        # capture its live state and load it into phase-2's loader via
+        # _load_stream_state. Phase 2 must then never re-read a phase-1 doc.
+        texts = _docs(140)
+        phase1 = self._train_loader(texts, block_size=8, num_shards=8)
+        phase2 = self._train_loader(texts, block_size=4, num_shards=8)
+
+        # Drive phase 1's raw source to learn which docs it consumed.
+        p1_src = phase1.dataset.source
+        it = iter(p1_src)
+        phase1_docs = {next(it)["text"] for _ in range(40)}
+
+        applied = train._load_stream_state(
+            phase2, train._capture_stream_state(phase1),
+        )
+        self.assertTrue(applied, "handoff must load phase-1 state into phase 2")
+
+        phase2_docs = {s["text"] for s in phase2.dataset.source}
+        self.assertEqual(phase1_docs & phase2_docs, set(),
+                         "phase 2 must not replay phase-1 docs after handoff")
+
+    def test_load_stream_state_noop_on_none(self):
+        loader = self._train_loader(_docs(40), block_size=8, num_shards=1)
+        self.assertFalse(train._load_stream_state(loader, None))
 
 
 class _FakeXm:
