@@ -1261,6 +1261,7 @@ def save_checkpoint(
     muon_hp: Optional[Any] = None,
     ema_model: Optional[AveragedModel] = None,
     keep_last_n: int = 0,
+    stream_docs_consumed: Optional[int] = None,
 ):
     save_dir.mkdir(parents=True, exist_ok=True)
     # Unwrap torch.compile so checkpoint keys load into a fresh, uncompiled model.
@@ -1272,6 +1273,11 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "metrics": metrics,
     }
+    # Streaming train-stream position so --resume continues from where it
+    # left off instead of replaying the stream head. None on the per-epoch
+    # path (a finite dataset is re-read in full each epoch by design).
+    if stream_docs_consumed is not None:
+        checkpoint["stream_docs_consumed"] = int(stream_docs_consumed)
     if scheduler is not None:
         checkpoint["scheduler_state_dict"] = scheduler.state_dict()
     if muon_hp is not None:
@@ -1315,6 +1321,45 @@ def find_latest_checkpoint(save_dir: Path) -> Optional[Path]:
     if not candidates:
         return None
     return max(candidates, key=lambda t: t[0])[1]
+
+
+def resolve_resume_path(resume_arg: Optional[str], save_dir: Path) -> Optional[Path]:
+    """Resolve the --resume argument to a checkpoint path (or None).
+
+    Shared by the resume-position peek (before loaders are built) and the
+    full model/optimizer restore (after the model exists) so both agree on
+    which checkpoint a run resumes from. Raises if an explicit path is
+    missing; returns None for 'none' or 'auto' with no prior checkpoint.
+    """
+    resume_arg = (resume_arg or "none").strip()
+    if resume_arg.lower() == "none":
+        return None
+    if resume_arg.lower() == "auto":
+        return find_latest_checkpoint(save_dir)
+    path = Path(resume_arg)
+    if not path.exists():
+        raise FileNotFoundError(f"--resume path {path} does not exist")
+    return path
+
+
+def read_stream_docs_consumed(path: Path, device: torch.device) -> int:
+    """Read just the checkpointed train-stream position from ``path``.
+
+    The streaming loader pipeline (.skip(val_docs) -> .skip(consumed) ->
+    .shuffle(seed,buffer)) must be built BEFORE the model exists, so we can't
+    get this from ``load_resume_checkpoint`` (which needs the model). Loading
+    the full checkpoint just for one int is acceptable: it happens once at
+    startup. Returns 0 for old checkpoints that predate the field, which
+    simply replays from the stream head (the prior behaviour).
+    """
+    try:
+        # weights_only=False to match load_resume_checkpoint: our own
+        # checkpoints carry optimizer/scheduler state, not just tensors, and
+        # are trusted local files written by this same training run.
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+    except (OSError, RuntimeError):
+        return 0
+    return int(ckpt.get("stream_docs_consumed", 0) or 0)
 
 
 def _summarize_keys(keys: list, label: str, limit: int = 5) -> str:
@@ -1409,24 +1454,48 @@ class PackedStream(torch.utils.data.IterableDataset):
     finite-corpus DataLoader produces, so downstream code is uniform.
     """
 
-    def __init__(self, source, tokenizer, block_size: int, text_key: str = "text"):
+    def __init__(
+        self,
+        source,
+        tokenizer,
+        block_size: int,
+        text_key: str = "text",
+        base_offset: int = 0,
+        emit_source_idx: bool = False,
+    ):
         self.source = source
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.text_key = text_key
+        # ``base_offset`` is the number of source documents already consumed
+        # by ``.skip(...)`` upstream (val hold-out + resume position), so
+        # ``base_offset + idx`` is the GLOBAL post-skip/post-shuffle source
+        # position of each document — what the resume logic checkpoints.
+        self.base_offset = base_offset
+        # Only the TRAIN stream emits ``source_idx`` so it can never leak
+        # into the model on the eval path (the eval PackedStream omits it).
+        self.emit_source_idx = emit_source_idx
 
     def __iter__(self):
         # Shard across DataLoader workers so ``num_workers > 0`` doesn't
-        # have every worker re-emit the same documents.
+        # have every worker re-emit the same documents. ``idx`` enumerates
+        # the FULL upstream source before striding, so it is the global
+        # source position regardless of worker count — exactly what we add
+        # ``base_offset`` to for the checkpointed stream position.
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
             stride, offset = 1, 0
         else:
             stride, offset = worker_info.num_workers, worker_info.id
         buf: list = []
+        # Carries the global source position of the document that contributed
+        # the LAST token currently in ``buf``; every chunk packed from ``buf``
+        # has been seen through at least this document.
+        last_source_idx = self.base_offset
         for idx, sample in enumerate(self.source):
             if (idx % stride) != offset:
                 continue
+            last_source_idx = self.base_offset + idx
             ids = self.tokenizer.encode(sample[self.text_key])
             ids.append(self.tokenizer.eos_token_id)
             buf.extend(ids)
@@ -1434,11 +1503,16 @@ class PackedStream(torch.utils.data.IterableDataset):
                 chunk = buf[: self.block_size]
                 buf = buf[self.block_size :]
                 input_ids = torch.tensor(chunk, dtype=torch.long)
-                yield {
+                out = {
                     "input_ids": input_ids,
                     "attention_mask": torch.ones_like(input_ids),
                     "labels": input_ids,
                 }
+                if self.emit_source_idx:
+                    out["source_idx"] = torch.tensor(
+                        last_source_idx, dtype=torch.long,
+                    )
+                yield out
 
 
 # ---------------------------------------------------------------------------
@@ -1526,6 +1600,41 @@ def _describe_dataset_source(
     return dataset + (f" / {dataset_config}" if dataset_config else "")
 
 
+def shuffle_train_stream(args, stream):
+    """Apply ``.shuffle(seed, buffer)`` to a train stream (no-op if buffer 0).
+
+    Call AFTER ``.skip(val_docs)`` (and after the resume ``.skip(consumed)``)
+    so neither the val hold-out nor the already-consumed docs are drawn into
+    the shuffle buffer. HF streaming shuffle also shuffles shard order, which
+    improves cross-shard mixing.
+
+    NOTE on resume ordering (deviation from a naive shuffle-then-skip): on a
+    single-shard iterable, HF's ``.skip(n)`` AFTER ``.shuffle`` drops only one
+    shard-block (often a single example), so it does NOT advance past the
+    consumed docs and would replay nearly the whole prefix. ``.skip(n)``
+    BEFORE ``.shuffle`` drops exactly ``n`` docs in corpus order, so we skip
+    the consumed count first and shuffle the remaining tail. Same ``--seed``
+    => deterministic shuffle of that tail; a resumed run never re-reads a
+    consumed doc (no systematic replay), at the cost of reshuffling the tail
+    rather than continuing one global permutation.
+    """
+    buffer = int(getattr(args, "stream_shuffle_buffer", 0) or 0)
+    if buffer > 0:
+        stream = stream.shuffle(seed=args.seed, buffer_size=buffer)
+    return stream
+
+
+def _shuffle_train_stream(args, stream):
+    """Resumable single-process train transform applied AFTER ``.skip(val_docs)``:
+    ``.skip(stream_docs_consumed)`` (corpus order) then ``.shuffle``. See
+    ``shuffle_train_stream`` for why skip precedes shuffle.
+    """
+    consumed = int(getattr(args, "stream_docs_consumed", 0) or 0)
+    if consumed > 0:
+        stream = stream.skip(consumed)
+    return shuffle_train_stream(args, stream)
+
+
 def build_streaming_loaders(
     args: argparse.Namespace,
     tokenizer,
@@ -1540,7 +1649,9 @@ def build_streaming_loaders(
 
     Caches the first ``--val-docs`` documents into memory for validation
     and uses ``.skip(val_docs)`` on the training stream so the slices
-    don't overlap.
+    don't overlap. The TRAIN stream is then shuffled and skipped by the
+    resume position (see ``_shuffle_train_stream``); the val stream stays
+    in original order so val PPL is comparable across runs.
     """
     if not args.dataset:
         raise ValueError(
@@ -1558,12 +1669,22 @@ def build_streaming_loaders(
     val_docs_full = list(val_stream.take(args.val_docs))
     if is_main_process():
         print(f"  cached {len(val_docs_full)} docs for val")
-    train_stream = load_dataset(**load_kwargs).skip(args.val_docs)
+    train_stream = _shuffle_train_stream(
+        args, load_dataset(**load_kwargs).skip(args.val_docs),
+    )
 
     val_docs = val_docs_full
 
+    # ``base_offset`` = docs already consumed PAST the val hold-out (the resume
+    # position), so ``source_idx`` reports the cumulative count of post-val
+    # corpus docs consumed — exactly the value the NEXT run feeds back as
+    # ``.skip(stream_docs_consumed)``. Only the train stream emits source_idx
+    # (the eval path never sees it).
+    train_base_offset = int(getattr(args, "stream_docs_consumed", 0) or 0)
     train_ds = PackedStream(train_stream, tokenizer, args.max_length,
-                            text_key=args.text_column)
+                            text_key=args.text_column,
+                            base_offset=train_base_offset,
+                            emit_source_idx=True)
     val_ds = PackedStream(val_docs, tokenizer, args.max_length,
                           text_key=args.text_column)
 
@@ -1602,9 +1723,14 @@ def build_streaming_train_loader(
         args.dataset, args.dataset_config,
         streaming=True, split="train",
     )
-    train_stream = load_dataset(**load_kwargs).skip(args.val_docs)
+    train_stream = _shuffle_train_stream(
+        args, load_dataset(**load_kwargs).skip(args.val_docs),
+    )
+    train_base_offset = int(getattr(args, "stream_docs_consumed", 0) or 0)
     train_ds = PackedStream(train_stream, tokenizer, block_size,
-                            text_key=args.text_column)
+                            text_key=args.text_column,
+                            base_offset=train_base_offset,
+                            emit_source_idx=True)
 
     def collate(batch):
         return {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
@@ -1759,6 +1885,10 @@ def run_step_training(
     train_loaders: Dict[int, DataLoader] = {1: train_loader}
     if phase1_steps > 0 and phase1_train_loader is not None:
         train_loaders[int(args.token_superposition_bag_size)] = phase1_train_loader
+    # Highest global source-doc index seen + 1, i.e. how many post-skip,
+    # post-shuffle source documents have been consumed. Seeded from the
+    # resume position so a restart's first save reflects total progress.
+    docs_consumed = int(getattr(args, "stream_docs_consumed", 0) or 0)
     while step < total_steps:
         if cudagraph_mark is not None:
             cudagraph_mark()
@@ -1774,6 +1904,17 @@ def run_step_training(
             train_iter = iter(active_loader)
             train_iters[bag_size] = train_iter
             batch = next(train_iter)
+
+        # Pop source_idx OUT of the batch before the model ever sees it.
+        # Track the consumed-doc count on the main process for the resume
+        # position. Under multi-worker prefetch a handful of docs may be
+        # re-seen once after a restart (the max over a prefetched window is
+        # slightly ahead of the strictly-committed point); that's acceptable
+        # — systematic stream-head replay is what this kills, not the odd
+        # duplicated doc.
+        batch_source_idx = batch.pop("source_idx", None)
+        if batch_source_idx is not None and main:
+            docs_consumed = max(docs_consumed, int(batch_source_idx.max()) + 1)
 
         ids = batch["input_ids"].to(device, non_blocking=True)
         lbls = batch["labels"].to(device, non_blocking=True)
@@ -2094,6 +2235,7 @@ def run_step_training(
                     save_dir=save_dir, is_best=is_best,
                     muon_hp=muon_hp, ema_model=ema_model,
                     keep_last_n=args.keep_last_n,
+                    stream_docs_consumed=docs_consumed if args.streaming else None,
                 )
             barrier()
         elif save_due:
@@ -2105,6 +2247,7 @@ def run_step_training(
                     save_dir=save_dir, is_best=False,
                     muon_hp=muon_hp, ema_model=ema_model,
                     keep_last_n=args.keep_last_n,
+                    stream_docs_consumed=docs_consumed if args.streaming else None,
                 )
             barrier()
 
@@ -2123,7 +2266,11 @@ def run_step_training(
     pbar.close()
     if main:
         print(f"\n=== Training complete in {(time.time() - t0) / 60:.1f} min ===")
-    return {"best_val_loss": best_val_loss, "history": history}
+    return {
+        "best_val_loss": best_val_loss,
+        "history": history,
+        "stream_docs_consumed": docs_consumed,
+    }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2444,10 +2591,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "optimizer + scheduler + muon_hp + EMA + step "
                              "counter so total_steps / WSD decay / muon "
                              "ramp continue from where they stopped. "
-                             "Streaming dataloaders re-iterate from the "
-                             "shard start — exact data position is not "
-                             "checkpointed, so the first few batches after "
-                             "resume may repeat.")
+                             "In --streaming mode the train-stream position "
+                             "(stream_docs_consumed) is also checkpointed and "
+                             "restored, so the run continues from where it "
+                             "left off instead of replaying the stream head "
+                             "(a handful of docs near the boundary may repeat "
+                             "once under multi-worker prefetch). Same --seed "
+                             "=> same shuffle order => deterministic "
+                             "continuation.")
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--no-save", action="store_true",
@@ -2539,6 +2690,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="With --streaming: how many of the first docs "
                              "to cache in memory for validation. The training "
                              "stream skips the same count to avoid overlap.")
+    parser.add_argument("--stream-shuffle-buffer", type=int, default=10000,
+                        help="With --streaming: buffer_size for the train "
+                             "stream's .shuffle(seed, buffer). Applied AFTER "
+                             "skipping the --val-docs hold-out (and the "
+                             "resume-position skip), so the val split stays "
+                             "fixed and unshuffled and a resumed run shuffles "
+                             "only the still-unread tail. HF streaming shuffle "
+                             "also shuffles shard order, improving cross-shard "
+                             "mixing. Same --seed => deterministic order; "
+                             "CHANGING --seed across resumes changes the "
+                             "order. Set 0 to disable shuffle (ablation).")
     parser.add_argument("--log-every", type=int, default=10,
                         help="Streaming-mode tqdm postfix update / running-loss "
                              "averaging window in steps.")
@@ -2624,6 +2786,23 @@ def main(args: Optional[argparse.Namespace] = None):
                 "--total-tokens (e.g. 10B); the schedule horizon and "
                 "loop termination both depend on it."
             )
+        # Resolve the resume position BEFORE building the loaders so the
+        # train stream pipeline is .skip(val_docs) -> .skip(consumed) ->
+        # .shuffle(seed,buffer) and the resumed run continues PAST the docs it
+        # already consumed. The full model/optimizer restore still happens
+        # later via load_resume_checkpoint.
+        args.stream_docs_consumed = 0
+        _resume_peek_path = resolve_resume_path(args.resume, save_dir)
+        if _resume_peek_path is not None:
+            args.stream_docs_consumed = read_stream_docs_consumed(
+                _resume_peek_path, torch.device("cpu"),
+            )
+            if main_proc and args.stream_docs_consumed > 0:
+                print(
+                    f"  Resuming stream at doc {args.stream_docs_consumed:,} "
+                    f"(skip val_docs -> skip {args.stream_docs_consumed:,} -> "
+                    f"shuffle(seed={args.seed}))"
+                )
         train_loader, val_loader = build_streaming_loaders(
             args, tokenizer,
         )
@@ -2836,27 +3015,19 @@ def main(args: Optional[argparse.Namespace] = None):
     # and EMA shadow continue uninterrupted.
     start_step = 0
     resume_arg = (args.resume or "none").strip()
-    if resume_arg.lower() != "none":
-        if resume_arg.lower() == "auto":
-            resume_path = find_latest_checkpoint(save_dir)
-        else:
-            resume_path = Path(resume_arg)
-            if not resume_path.exists():
-                raise FileNotFoundError(
-                    f"--resume path {resume_path} does not exist"
-                )
-        if resume_path is not None:
-            if main_proc:
-                print(f"  Resuming from {resume_path}")
-            start_step = load_resume_checkpoint(
-                resume_path, raw_model, optimizer, scheduler,
-                muon_hp, ema_model, device,
-            )
-            if main_proc:
-                print(f"    resumed at step/epoch {start_step}")
-        elif main_proc and resume_arg.lower() == "auto":
-            print("  --resume auto: no prior checkpoint under "
-                  f"{save_dir}, starting fresh")
+    resume_path = resolve_resume_path(args.resume, save_dir)
+    if resume_path is not None:
+        if main_proc:
+            print(f"  Resuming from {resume_path}")
+        start_step = load_resume_checkpoint(
+            resume_path, raw_model, optimizer, scheduler,
+            muon_hp, ema_model, device,
+        )
+        if main_proc:
+            print(f"    resumed at step/epoch {start_step}")
+    elif main_proc and resume_arg.lower() == "auto":
+        print("  --resume auto: no prior checkpoint under "
+              f"{save_dir}, starting fresh")
     barrier()
 
     def sample_text(prompt: str, max_new_tokens: int, temperature: float) -> str:
@@ -2919,6 +3090,7 @@ def main(args: Optional[argparse.Namespace] = None):
         )
         history = result["history"]
         best_val_loss = result["best_val_loss"]
+        final_stream_docs_consumed = result.get("stream_docs_consumed")
         val_metrics = (history[-1].get("val") if history
                        else {"loss": float("inf"), "ppl": float("inf")})
         train_metrics = val_metrics  # streaming path doesn't track per-epoch train metrics
@@ -2961,6 +3133,7 @@ def main(args: Optional[argparse.Namespace] = None):
                     "ema_state_dict": ema_model.state_dict() if ema_model else None,
                     "metrics": val_metrics,
                     "history": history,
+                    "stream_docs_consumed": final_stream_docs_consumed,
                 }, final_path)
                 print(f"Final checkpoint saved to {final_path}")
             else:

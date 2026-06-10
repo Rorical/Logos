@@ -130,6 +130,7 @@ def save_checkpoint_xla(
     muon_hp: Optional[Any] = None,
     ema_model: Optional[AveragedModel] = None,
     keep_last_n: int = 0,
+    stream_docs_consumed: Optional[int] = None,
 ):
     _safe_mkdir_main(xm, save_dir)
     inner = _model_for_state_dict(model)
@@ -139,6 +140,10 @@ def save_checkpoint_xla(
         "optimizer_state_dict": optimizer.state_dict(),
         "metrics": metrics,
     }
+    # Within-shard train-stream position for resumable streaming (None on the
+    # per-epoch path, which re-reads a finite dataset in full each epoch).
+    if stream_docs_consumed is not None:
+        checkpoint["stream_docs_consumed"] = int(stream_docs_consumed)
     if scheduler is not None:
         checkpoint["scheduler_state_dict"] = scheduler.state_dict()
     if muon_hp is not None:
@@ -510,6 +515,12 @@ def run_step_training_xla(
         train_loaders[int(args.token_superposition_bag_size)] = phase1_train_loader
     device_loaders: Dict[int, Any] = {}
     train_iters: Dict[int, Any] = {}
+    # GLOBAL post-val corpus docs consumed (the unit that feeds back as
+    # .skip(stream_docs_consumed)). source_idx is a within-shard local index,
+    # so a per-replica count of K maps to ~K*world_size global docs. Seed from
+    # the resume position so the first save reflects total progress.
+    consumed_resume = int(getattr(args, "stream_docs_consumed", 0) or 0)
+    docs_consumed = consumed_resume
     while step < total_steps:
         bag_size = base.token_superposition_bag_size_for_step(args, step, total_steps)
         device_loader = device_loaders.get(bag_size)
@@ -536,6 +547,20 @@ def run_step_training_xla(
             train_iter = iter(device_loader)
             train_iters[bag_size] = train_iter
             batch = next(train_iter)
+
+        # Pop source_idx OUT of the batch before the model sees it (the
+        # MpDeviceLoader already moved it to the XLA device, so popping here
+        # also keeps it out of the graph). Track the within-shard consumed-doc
+        # count on the main replica; replicas advance in lockstep so rank-0's
+        # count is a good resume offset for all. A few docs near the boundary
+        # may re-appear once after a restart under multi-worker prefetch —
+        # acceptable; systematic stream-head replay is what this kills.
+        batch_source_idx = batch.pop("source_idx", None)
+        if batch_source_idx is not None and main:
+            within_shard = int(batch_source_idx.max()) + 1
+            docs_consumed = max(
+                docs_consumed, consumed_resume + within_shard * world_size,
+            )
 
         ids = batch["input_ids"]
         lbls = batch["labels"]
@@ -693,6 +718,7 @@ def run_step_training_xla(
                     save_dir=save_dir, is_best=is_best,
                     muon_hp=muon_hp, ema_model=ema_model,
                     keep_last_n=args.keep_last_n,
+                    stream_docs_consumed=docs_consumed if args.streaming else None,
                 )
         elif save_due:
             save_checkpoint_xla(
@@ -701,6 +727,7 @@ def run_step_training_xla(
                 save_dir=save_dir, is_best=False,
                 muon_hp=muon_hp, ema_model=ema_model,
                 keep_last_n=args.keep_last_n,
+                stream_docs_consumed=docs_consumed if args.streaming else None,
             )
 
         if (
@@ -724,7 +751,11 @@ def run_step_training_xla(
     if main:
         pbar.close()
         print(f"\n=== Training complete in {(time.time() - t0) / 60:.1f} min ===")
-    return {"best_val_loss": best_val_loss, "history": history}
+    return {
+        "best_val_loss": best_val_loss,
+        "history": history,
+        "stream_docs_consumed": docs_consumed,
+    }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -875,12 +906,25 @@ def _build_streaming_loaders_xla(args, tokenizer, xm, rank: int, world_size: int
     if _xla_is_main(xm):
         print(f"  cached {len(val_docs_full)} docs for val")
 
+    # Pipeline: .skip(val_docs) -> .skip(consumed_global) -> .shuffle(seed)
+    # -> .shard(world_size, rank). Skip BEFORE shuffle (HF's .skip after a
+    # shuffle drops only one shard-block on a single-shard stream and would
+    # replay the prefix — see base.shuffle_train_stream). consumed_global is a
+    # GLOBAL post-val corpus-doc count, so every replica skips the same prefix
+    # and then shards the shuffled tail. Each replica's PackedStream enumerates
+    # its own shard, so source_idx reports a within-shard local index here
+    # (base_offset=0); the loop scales it back to a global count.
+    consumed_global = int(getattr(args, "stream_docs_consumed", 0) or 0)
     train_stream = load_dataset(**load_kwargs).skip(args.val_docs)
+    if consumed_global > 0:
+        train_stream = train_stream.skip(consumed_global)
+    train_stream = base.shuffle_train_stream(args, train_stream)
     if world_size > 1:
         train_stream = train_stream.shard(num_shards=world_size, index=rank)
 
     train_ds = base.PackedStream(
         train_stream, tokenizer, args.max_length, text_key=args.text_column,
+        emit_source_idx=True,
     )
     val_ds = base.PackedStream(
         val_docs_full, tokenizer, args.max_length, text_key=args.text_column,
@@ -910,13 +954,16 @@ def _build_streaming_loaders_xla(args, tokenizer, xm, rank: int, world_size: int
                 f"block_size={phase1_block_size}"
             )
         train_stream_phase1 = load_dataset(**load_kwargs).skip(args.val_docs)
+        if consumed_global > 0:
+            train_stream_phase1 = train_stream_phase1.skip(consumed_global)
+        train_stream_phase1 = base.shuffle_train_stream(args, train_stream_phase1)
         if world_size > 1:
             train_stream_phase1 = train_stream_phase1.shard(
                 num_shards=world_size, index=rank,
             )
         phase1_ds = base.PackedStream(
             train_stream_phase1, tokenizer, phase1_block_size,
-            text_key=args.text_column,
+            text_key=args.text_column, emit_source_idx=True,
         )
         phase1_train_loader = DataLoader(phase1_ds, **common_kw)
     return train_loader, val_loader, phase1_train_loader
@@ -1003,6 +1050,21 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
             raise ValueError(
                 "--streaming requires --total-steps N (N > 0) or --total-tokens"
             )
+        # Resolve the resume stream position BEFORE building the loaders so the
+        # train pipeline becomes .skip(val_docs) -> .skip(consumed) -> .shuffle
+        # -> .shard. The full model/optimizer restore happens later.
+        args.stream_docs_consumed = 0
+        _resume_peek_path = base.resolve_resume_path(args.resume, save_dir)
+        if _resume_peek_path is not None:
+            args.stream_docs_consumed = base.read_stream_docs_consumed(
+                _resume_peek_path, torch.device("cpu"),
+            )
+            if main_proc and args.stream_docs_consumed > 0:
+                print(
+                    "  Resuming stream at global doc "
+                    f"{args.stream_docs_consumed:,} (skip val_docs -> "
+                    f"skip {args.stream_docs_consumed:,} -> shuffle -> shard)"
+                )
         train_loader, val_loader, phase1_train_loader = _build_streaming_loaders_xla(
             args, tokenizer, xm, rank=rank, world_size=world_size,
         )
@@ -1134,6 +1196,7 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
         )
         history = result["history"]
         best_val_loss = result["best_val_loss"]
+        final_stream_docs_consumed = result.get("stream_docs_consumed")
         val_metrics = (history[-1].get("val") if history
                        else {"loss": float("inf"), "ppl": float("inf")})
         if main_proc:
@@ -1176,6 +1239,7 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
                     "ema_state_dict": ema_model.state_dict() if ema_model else None,
                     "metrics": val_metrics,
                     "history": history,
+                    "stream_docs_consumed": final_stream_docs_consumed,
                 },
                 save_dir,
             )
