@@ -590,18 +590,37 @@ class CompressedGlobalAttention(nn.Module):
 
         Teacher: per-head softmax over groups of the dense (pre-top-k) scores,
         summed across heads then L1-renormalized over groups, in fp32 and
-        DETACHED. Student: log-softmax of the head-combined indexer scores over
-        groups. Averaged over query rows that have at least one valid group.
+        DETACHED. When ``attention_sink`` is on, the dense forward softmaxes the
+        group scores together with a learned per-head sink logit column and uses
+        only the group slice of those weights, so the teacher is built from that
+        SAME sink-augmented softmax: concat the sink column, softmax over
+        [groups, sink], then drop the sink column. Crucially the surviving
+        per-head group mass is kept (NOT renormalized back to 1 per head) before
+        the head-sum, then the head-summed mass is L1-renormalized once per query
+        -- i.e. the teacher over groups is the conditional distribution given
+        'not sink'. (Renormalizing each head to 1 first would cancel the sink
+        exactly and leave the teacher sink-free; summing the sink-deducted masses
+        instead down-weights heads that route mass into the sink, matching the
+        attention the indexer must imitate.) Student: log-softmax of the
+        head-combined indexer scores over groups. Averaged over query rows that
+        have at least one valid group; the zero-valid case yields 0 via a clamped
+        denominator (no python-level branch on a tensor, so no Dynamo graph break
+        / device->host sync per CSA layer per step).
         """
         B, H, T, G = scores.shape
         valid_row = (~invalid).any(dim=-1)  # [B, T]
         n_valid = valid_row.sum()
-        if n_valid == 0:
-            return torch.zeros((), device=scores.device, dtype=scores.dtype)
 
         # Teacher distribution over groups (detached). Fully-masked rows softmax
-        # to NaN (all -inf); zero them out and exclude via valid_row below.
-        per_head = F.softmax(scores.float(), dim=-1)  # [B, H, T, G]
+        # to NaN (all -inf), or to all-sink mass when the sink column is present;
+        # either way the group mass is zeroed and the row excluded via valid_row.
+        scores_f = scores.float()
+        if self.attention_sink:
+            sink = self.sink_logit.detach().float().view(1, H, 1, 1).expand(B, -1, T, -1)
+            aug = torch.cat([scores_f, sink], dim=-1)  # [B, H, T, G+1]
+            per_head = F.softmax(aug, dim=-1)[..., :G]  # [B, H, T, G]
+        else:
+            per_head = F.softmax(scores_f, dim=-1)  # [B, H, T, G]
         per_head = torch.nan_to_num(per_head, nan=0.0)
         target = per_head.sum(dim=1)  # [B, T, G]
         target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-9)
@@ -615,7 +634,9 @@ class CompressedGlobalAttention(nn.Module):
 
         kl = (target * (target.clamp_min(1e-9).log() - student_logp)).sum(dim=-1)  # [B, T]
         kl = kl * valid_row.to(kl.dtype)
-        loss = kl.sum() / n_valid.to(kl.dtype)
+        # Branch-free masked mean: clamp the denominator so an all-invalid batch
+        # (n_valid == 0, hence kl.sum() == 0) yields 0 instead of 0/0.
+        loss = kl.sum() / n_valid.to(kl.dtype).clamp_min(1.0)
         return loss.to(scores.dtype)
 
     def forward(
