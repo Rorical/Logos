@@ -1099,14 +1099,18 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
     )
     if base.token_superposition_enabled(args) and not args.streaming:
         args.total_steps = total_steps
-    muon_params, embed_params, default_params, router_params = base.split_param_groups(model)
+    muon_params, embed_params, no_decay_params, default_params, router_params = (
+        base.split_param_groups(model)
+    )
     optimizer, scheduler, muon_hp = base.build_optimizer_and_scheduler(
         args, total_steps, fused_adamw,
         muon_params, embed_params, default_params, router_params,
+        no_decay_params=no_decay_params,
     )
     if main_proc:
         n_muon = sum(p.numel() for p in muon_params)
         n_embed = sum(p.numel() for p in embed_params)
+        n_no_decay = sum(p.numel() for p in no_decay_params)
         n_default = sum(p.numel() for p in default_params)
         n_router = sum(p.numel() for p in router_params)
         if args.muon and n_muon > 0:
@@ -1114,10 +1118,14 @@ def _xla_worker(index: int, args: argparse.Namespace) -> None:
             print(f"    Muon tensors: {len(muon_params)}, params: {n_muon:,}")
             print(f"    AdamW embed tensors: {len(embed_params)}, params: {n_embed:,}")
             print(f"    AdamW default tensors: {len(default_params)}, params: {n_default:,}")
+            if no_decay_params:
+                print(f"    AdamW no_decay tensors: {len(no_decay_params)}, "
+                      f"params: {n_no_decay:,} (wd=0)")
             if router_params:
                 print(f"    AdamW router tensors: {len(router_params)}, params: {n_router:,}")
         else:
-            print(f"  Optimizer: AdamW only ({n_muon + n_embed + n_default + n_router:,} params)")
+            print(f"  Optimizer: AdamW only "
+                  f"({n_muon + n_embed + n_no_decay + n_default + n_router:,} params)")
         print(f"  LR schedule: {args.scheduler} "
               f"(warmup {args.warmup_steps} / {total_steps} total)")
 

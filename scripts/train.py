@@ -599,24 +599,33 @@ class MultiScheduler:
 
 
 def split_param_groups(model):
-    """Four-way split for the Muon/AdamW recipe.
+    """Five-way split for the Muon/AdamW recipe.
 
-    * ``muon``    — exactly-2D weights inside transformer blocks
-                    (``nn.Linear.weight``). PyTorch's Muon hard-rejects
-                    non-2D tensors, so this also enforces correctness.
-    * ``embed``   — ``token_emb.weight`` (and ``lm_head.weight`` if the
-                    model untied them). Routed to AdamW with a higher
-                    base lr because input embeddings receive sparse
-                    per-token gradients and benefit from larger steps.
-    * ``default`` — RMSNorm scales, attention sink logits, biases (1D),
-                    plus 3D ``Conv1d`` kernels in KDA attention.
-                    Handled by AdamW at the standard base lr.
-    * ``router``  — MoE ``Router.linear.weight`` matrices. Pulled out
-                    of ``muon`` so they can run on AdamW with a smaller
-                    LR and a longer warmup; the bias-balance mechanism
-                    needs time to find a balanced equilibrium before
-                    router weights start moving aggressively, otherwise
-                    early imbalances lock in a fixed top-K subset.
+    * ``muon``     — exactly-2D weights inside transformer blocks
+                     (``nn.Linear.weight``). PyTorch's Muon hard-rejects
+                     non-2D tensors, so this also enforces correctness.
+    * ``embed``    — ``token_emb.weight`` (and ``lm_head.weight`` if the
+                     model untied them). Routed to AdamW with a higher
+                     base lr because input embeddings receive sparse
+                     per-token gradients and benefit from larger steps.
+    * ``no_decay`` — RMSNorm scales, attention sink logits, biases (1D),
+                     BlockAttentionResidual ``proj`` vectors, and any
+                     parameter flagged ``_no_weight_decay`` (KDA's
+                     ``A_log`` / ``dt_bias``). Handled by AdamW at the
+                     standard base lr with ``weight_decay=0`` — decaying
+                     gains/biases/gates is the classic AdamW mistake that
+                     shrinks norm scales toward 0 and biases the MoE
+                     balancer.
+    * ``default``  — remaining AdamW-side tensors that *do* want decay
+                     (currently only 3D ``Conv1d`` kernels in KDA, which
+                     are >1D yet not 2D so they miss the Muon bucket).
+                     Handled by AdamW at the standard base lr.
+    * ``router``   — MoE ``Router.linear.weight`` matrices. Pulled out
+                     of ``muon`` so they can run on AdamW with a smaller
+                     LR and a longer warmup; the bias-balance mechanism
+                     needs time to find a balanced equilibrium before
+                     router weights start moving aggressively, otherwise
+                     early imbalances lock in a fixed top-K subset.
 
     Tied tensors are deduped by ``id()`` — when ``lm_head.weight is
     token_emb.weight`` (current default in every model here), the
@@ -638,21 +647,34 @@ def split_param_groups(model):
     seen: set[int] = set()
     muon: list = []
     embed: list = []
+    no_decay: list = []
     default: list = []
     router: list = []
     for _, param in model.named_parameters():
         if not param.requires_grad or id(param) in seen:
             continue
         seen.add(id(param))
+        flagged = getattr(param, "_no_weight_decay", False)
         if id(param) in embed_ids:
+            # Embeddings keep wd (the tied table is stable under wd 0.1).
             embed.append(param)
         elif id(param) in router_ids:
             router.append(param)
+        elif flagged:
+            # Honor the explicit no-decay flag regardless of ndim so a
+            # flagged 2D tensor can't silently land in Muon and bypass
+            # its zero-wd contract. Today the only flags are KDA's 1D
+            # A_log / dt_bias.
+            no_decay.append(param)
         elif param.ndim == 2:
             muon.append(param)
+        elif param.ndim <= 1:
+            # RMSNorm scales, sink logits, biases, BAR proj vectors —
+            # decaying these is harmful, so AdamW must run wd=0 here.
+            no_decay.append(param)
         else:
             default.append(param)
-    return muon, embed, default, router
+    return muon, embed, no_decay, default, router
 
 
 def wsd_lr_lambda(warmup_steps: int, decay_steps: int, total_steps: int):
@@ -768,18 +790,27 @@ def build_optimizer_and_scheduler(
     embed_params: list,
     default_params: list,
     router_params: Optional[list] = None,
+    no_decay_params: Optional[list] = None,
 ):
     """Build the Muon + AdamW pair and their schedulers.
 
-    AdamW carries up to three param groups (embed, default, router)
-    with different base lrs. The WSD/cosine multiplier scales each
-    group's ``lr`` by its own lambda — embed/default share the global
-    warmup, while router uses a longer warmup (``--router-warmup-steps``
-    or ``3 * --warmup-steps`` by default). ``--no-muon`` collapses the
+    AdamW carries up to four param groups (embed, default, no_decay,
+    router) with their own base lrs and explicit per-group weight decay.
+    The WSD/cosine multiplier scales each group's ``lr`` by its own
+    lambda — embed/default/no_decay share the global warmup, while
+    router uses a longer warmup (``--router-warmup-steps`` or
+    ``3 * --warmup-steps`` by default). ``--no-muon`` collapses the
     matrix bucket into AdamW's default group at the AdamW lr; routers
     keep their dedicated group regardless.
+
+    Weight decay is set per AdamW group, not via the optimizer-level
+    default: ``embed`` and ``default`` and ``router`` keep
+    ``args.weight_decay`` (router.linear.weight is 2D and decayed today),
+    while ``no_decay`` runs at ``0.0`` so norm scales, biases, sink
+    logits, BAR proj vectors, and flagged KDA params are never decayed.
     """
     router_params = list(router_params or [])
+    no_decay_params = list(no_decay_params or [])
     use_muon = args.muon and len(muon_params) > 0
     if not use_muon:
         default_params = list(default_params) + list(muon_params)
@@ -803,16 +834,37 @@ def build_optimizer_and_scheduler(
     # (router groups get a longer warmup than embed/default).
     adamw_group_kinds: list = []
     if embed_params:
-        adamw_groups.append({"params": embed_params, "lr": args.embed_lr})
+        adamw_groups.append({
+            "params": embed_params,
+            "lr": args.embed_lr,
+            "weight_decay": args.weight_decay,
+        })
         adamw_group_kinds.append("base")
     if default_params:
-        adamw_groups.append({"params": default_params, "lr": args.lr})
+        adamw_groups.append({
+            "params": default_params,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+        })
+        adamw_group_kinds.append("base")
+    if no_decay_params:
+        adamw_groups.append({
+            "params": no_decay_params,
+            "lr": args.lr,
+            "weight_decay": 0.0,
+        })
         adamw_group_kinds.append("base")
     if router_params:
-        adamw_groups.append({"params": router_params, "lr": args.router_lr})
+        adamw_groups.append({
+            "params": router_params,
+            "lr": args.router_lr,
+            "weight_decay": args.weight_decay,
+        })
         adamw_group_kinds.append("router")
     adamw_opt = None
     if adamw_groups:
+        # Per-group weight_decay is set explicitly above; the optimizer
+        # default below only applies to groups that omit it (none do).
         adamw_opt = torch.optim.AdamW(
             adamw_groups,
             lr=args.lr,
@@ -2933,13 +2985,17 @@ def main(args: Optional[argparse.Namespace] = None):
     if token_superposition_enabled(args) and not args.streaming:
         args.total_steps = total_steps
 
-    muon_params, embed_params, default_params, router_params = split_param_groups(model)
+    muon_params, embed_params, no_decay_params, default_params, router_params = (
+        split_param_groups(model)
+    )
     optimizer, scheduler, muon_hp = build_optimizer_and_scheduler(
         args, total_steps, fused_adamw,
         muon_params, embed_params, default_params, router_params,
+        no_decay_params=no_decay_params,
     )
     n_muon = sum(p.numel() for p in muon_params)
     n_embed = sum(p.numel() for p in embed_params)
+    n_no_decay = sum(p.numel() for p in no_decay_params)
     n_default = sum(p.numel() for p in default_params)
     n_router = sum(p.numel() for p in router_params)
     router_warmup = (
@@ -2957,6 +3013,9 @@ def main(args: Optional[argparse.Namespace] = None):
             print(f"    AdamW default (lr={args.lr}): "
                   f"{len(default_params)} tensors, {n_default:,} params"
                   + (" (fused)" if fused_adamw else ""))
+            if no_decay_params:
+                print(f"    AdamW no_decay (lr={args.lr}, wd=0): "
+                      f"{len(no_decay_params)} tensors, {n_no_decay:,} params")
             if router_params:
                 print(f"    AdamW router (lr={args.router_lr}, "
                       f"warmup {router_warmup}): "
@@ -2969,7 +3028,7 @@ def main(args: Optional[argparse.Namespace] = None):
                       f"{args.muon_wd_end} linearly over {total_steps} steps")
         else:
             print(f"  Optimizer: AdamW only "
-                  f"({n_muon + n_embed + n_default + n_router:,} params)"
+                  f"({n_muon + n_embed + n_no_decay + n_default + n_router:,} params)"
                   + (" (fused)" if fused_adamw else ""))
         print(f"  LR schedule: {args.scheduler} "
               f"(warmup {args.warmup_steps}"
