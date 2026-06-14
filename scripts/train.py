@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import json
 import math
+import os
 import pickle
 import re
 import sys
@@ -19,8 +20,10 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from datasets import load_dataset, DatasetDict
 from tqdm import tqdm
 
@@ -159,8 +162,72 @@ def derive_steps_from_token_budget(
     return max(2, lo)
 
 
+_DISTRIBUTED_INITIALIZED_HERE = False
+
+
+def init_distributed_from_env() -> Tuple[int, int, int]:
+    """Initialise torch.distributed when launched by ``torchrun``.
+
+    The GPU path is pure data parallelism: one process owns one full model
+    replica on one CUDA device, and DDP synchronizes gradients after backward.
+    With no ``WORLD_SIZE`` env var this is a no-op, preserving the single-card
+    CLI behaviour.
+    """
+    global _DISTRIBUTED_INITIALIZED_HERE
+    world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+    rank = int(os.environ.get("RANK", "0") or "0")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0") or "0")
+    if world_size <= 1:
+        return rank, world_size, local_rank
+    if not dist.is_available():
+        raise RuntimeError(
+            "WORLD_SIZE > 1 but torch.distributed is not available; "
+            "install a distributed-capable PyTorch build or run single process."
+        )
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if backend == "nccl":
+        torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend, init_method="env://")
+        _DISTRIBUTED_INITIALIZED_HERE = True
+    return rank, world_size, local_rank
+
+
+def cleanup_distributed() -> None:
+    if _DISTRIBUTED_INITIALIZED_HERE and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def distributed_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
+def distributed_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def distributed_local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", "0") or "0")
+
+
+def is_distributed() -> bool:
+    return distributed_world_size() > 1
+
+
 def is_main_process() -> bool:
-    return True
+    return distributed_rank() == 0
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """Return the underlying user module under DDP and/or torch.compile."""
+    inner = getattr(model, "_orig_mod", model)
+    if isinstance(inner, DistributedDataParallel):
+        inner = inner.module
+    return getattr(inner, "_orig_mod", inner)
 
 
 def configure_compile_logging(show_autotune_logs: bool) -> None:
@@ -207,12 +274,39 @@ def configure_compile_logging(show_autotune_logs: bool) -> None:
     )
 
 
-def all_reduce_mean(t: torch.Tensor) -> torch.Tensor:
+def all_reduce_sum(t: torch.Tensor) -> torch.Tensor:
+    if dist.is_available() and dist.is_initialized():
+        out = t.clone()
+        dist.all_reduce(out, op=dist.ReduceOp.SUM)
+        return out
     return t
 
 
+def all_reduce_mean(t: torch.Tensor) -> torch.Tensor:
+    if dist.is_available() and dist.is_initialized():
+        return all_reduce_sum(t) / dist.get_world_size()
+    return t
+
+
+def all_reduce_min(t: torch.Tensor) -> torch.Tensor:
+    if dist.is_available() and dist.is_initialized():
+        out = t.clone()
+        dist.all_reduce(out, op=dist.ReduceOp.MIN)
+        return out
+    return t
+
+
+def gather_object_all_ranks(obj: Any) -> List[Any]:
+    if not (dist.is_available() and dist.is_initialized()):
+        return [obj]
+    gathered: List[Any] = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(gathered, obj)
+    return gathered
+
+
 def barrier() -> None:
-    return None
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +407,7 @@ def _moe_load_metrics(
     counts = torch.bincount(
         topk_indices.reshape(-1), minlength=num_experts,
     ).float()
+    counts = all_reduce_sum(counts)
     total = counts.sum().clamp(min=1.0)
     frac = counts / total
     target = 1.0 / num_experts
@@ -1126,6 +1221,8 @@ def create_dataloader(
     prefetch_factor: int = 4,
     seed: int = 0,
     drop_last: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
     """Wrap a finite tokenised HF dataset in a PyTorch DataLoader."""
 
@@ -1158,9 +1255,20 @@ def create_dataloader(
         }
 
     ds = _Dataset(dataset)
+    sampler = None
+    if int(world_size) > 1:
+        sampler = DistributedSampler(
+            ds,
+            num_replicas=int(world_size),
+            rank=int(rank),
+            shuffle=shuffle,
+            seed=int(seed),
+            drop_last=drop_last,
+        )
     loader_kwargs: Dict[str, Any] = dict(
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=(shuffle if sampler is None else False),
+        sampler=sampler,
         collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
@@ -1172,6 +1280,15 @@ def create_dataloader(
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = prefetch_factor
     return DataLoader(ds, **loader_kwargs)
+
+
+def _set_distributed_sampler_epoch(
+    dataloader: DataLoader,
+    epoch: int,
+) -> None:
+    sampler = getattr(dataloader, "sampler", None)
+    if isinstance(sampler, DistributedSampler):
+        sampler.set_epoch(int(epoch))
 
 
 def run_epoch(
@@ -1193,6 +1310,8 @@ def run_epoch(
     model.train(is_train)
 
     main = is_main_process()
+    if is_train:
+        _set_distributed_sampler_epoch(dataloader, epoch)
 
     # Accumulate the weighted loss on-device so per-step ``.item()`` calls
     # don't stall the host between CUDA-graph replays under
@@ -1226,7 +1345,7 @@ def run_epoch(
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
-            inner = getattr(model, "_orig_mod", model)
+            inner = unwrap_model(model)
             set_moe_training_step(
                 inner,
                 max(0, (epoch - 1) * len(dataloader) + step),
@@ -1265,14 +1384,14 @@ def run_epoch(
             # post-step balance controller never activates.
             topk_indices = outputs.get("topk_indices")
             if topk_indices is not None:
-                inner = getattr(model, "_orig_mod", model)
+                inner = unwrap_model(model)
                 inner.update_router_biases(topk_indices)
 
             if ema_model is not None:
                 # AveragedModel was built around the uncompiled module;
                 # feed it the same uncompiled instance so parameter
                 # ids match.
-                inner = getattr(model, "_orig_mod", model)
+                inner = unwrap_model(model)
                 ema_model.update_parameters(inner)
 
         batch_size = input_ids.size(0)
@@ -1298,9 +1417,18 @@ def run_epoch(
 
     pbar.close()
 
-    total_loss = total_loss_t.item()
-    total_lm_loss = total_lm_loss_t.item()
-    total_aux_loss = total_aux_loss_t.item()
+    totals = torch.stack([
+        total_loss_t,
+        total_lm_loss_t,
+        total_aux_loss_t,
+        torch.tensor(float(num_batches), device=device, dtype=torch.float64),
+    ])
+    totals = all_reduce_sum(totals)
+
+    total_loss = totals[0].item()
+    total_lm_loss = totals[1].item()
+    total_aux_loss = totals[2].item()
+    num_batches = int(totals[3].item())
 
     if num_batches == 0:
         return {"loss": float("inf"), "ppl": float("inf")}
@@ -1489,6 +1617,58 @@ def read_stream_state(path: Path, device: torch.device) -> Optional[dict]:
     return state if isinstance(state, dict) else None
 
 
+def select_rank_stream_state(
+    stream_state: Optional[dict],
+    rank: int,
+    world_size: int,
+) -> Optional[dict]:
+    """Pick this rank's saved HF stream state from a DDP checkpoint.
+
+    Single-process checkpoints store the raw HF ``state_dict``. DDP
+    checkpoints store ``{"world_size": N, "rank_states": [...]}`` because each
+    shard advances independently. A mismatch means the old per-rank stream
+    positions cannot be mapped safely to the new topology, so the data stream
+    restarts while model/optimizer state still resumes.
+    """
+    if stream_state is None:
+        return None
+    rank_states = stream_state.get("rank_states")
+    if isinstance(rank_states, list):
+        saved_world_size = int(stream_state.get("world_size", len(rank_states)))
+        if saved_world_size == int(world_size) and int(rank) < len(rank_states):
+            state = rank_states[int(rank)]
+            return state if isinstance(state, dict) else None
+        if is_main_process():
+            print(
+                "  Saved DDP stream_state world_size "
+                f"({saved_world_size}) does not match current world_size "
+                f"({world_size}); stream restarts from the head."
+            )
+        return None
+    if int(world_size) == 1:
+        return stream_state
+    if is_main_process():
+        print(
+            "  Resume checkpoint has a single-rank stream_state; current "
+            "DDP run cannot safely shard it, so the stream restarts."
+        )
+    return None
+
+
+def pack_rank_stream_states(local_state: Optional[dict]) -> Optional[dict]:
+    world_size = distributed_world_size()
+    if world_size <= 1:
+        return local_state
+    rank_states = gather_object_all_ranks(local_state)
+    if all(state is None for state in rank_states):
+        return None
+    return {
+        "format": "ddp_rank_stream_states_v1",
+        "world_size": world_size,
+        "rank_states": rank_states,
+    }
+
+
 def _summarize_keys(keys: list, label: str, limit: int = 5) -> str:
     if not keys:
         return ""
@@ -1590,6 +1770,8 @@ class PackedStream(torch.utils.data.IterableDataset):
         base_offset: int = 0,
         emit_source_idx: bool = False,
         resume_state: Optional[dict] = None,
+        rank_stride: int = 1,
+        rank_offset: int = 0,
     ):
         self.source = source
         self.tokenizer = tokenizer
@@ -1604,6 +1786,13 @@ class PackedStream(torch.utils.data.IterableDataset):
         # counter for logging); the actual resume mechanism is the HF
         # IterableDataset ``state_dict``/``load_state_dict`` captured below.
         self.emit_source_idx = emit_source_idx
+        self.rank_stride = max(1, int(rank_stride))
+        self.rank_offset = int(rank_offset)
+        if not (0 <= self.rank_offset < self.rank_stride):
+            raise ValueError(
+                "rank_offset must be in [0, rank_stride); "
+                f"got offset={rank_offset}, stride={rank_stride}"
+            )
         # Exact-resume support. ``resume_state`` is a HF IterableDataset
         # ``state_dict`` captured by a previous run; loading it makes the
         # source pick up exactly where it left off (zero replay of consumed
@@ -1631,11 +1820,10 @@ class PackedStream(torch.utils.data.IterableDataset):
         return fn() if callable(fn) else None
 
     def __iter__(self):
-        # Shard across DataLoader workers so ``num_workers > 0`` doesn't
-        # have every worker re-emit the same documents. ``idx`` enumerates
-        # the FULL upstream source before striding, so ``base_offset + idx``
-        # is the global post-skip source position — now used only as the
-        # diagnostic ``source_idx`` counter (resume runs off ``hf_state_dict``).
+        # Shard across DDP ranks (when HF data-source sharding is unavailable)
+        # and then across DataLoader workers. ``source_idx`` is deliberately a
+        # within-rank diagnostic counter; DDP callers convert it to an
+        # approximate global doc count with ``world_size``.
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
             stride, offset = 1, 0
@@ -1647,9 +1835,12 @@ class PackedStream(torch.utils.data.IterableDataset):
         # has been seen through at least this document.
         last_source_idx = self.base_offset
         for idx, sample in enumerate(self.source):
-            if (idx % stride) != offset:
+            if (idx % self.rank_stride) != self.rank_offset:
                 continue
-            last_source_idx = self.base_offset + idx
+            rank_local_idx = idx // self.rank_stride
+            if (rank_local_idx % stride) != offset:
+                continue
+            last_source_idx = self.base_offset + rank_local_idx
             ids = self.tokenizer.encode(sample[self.text_key])
             ids.append(self.tokenizer.eos_token_id)
             buf.extend(ids)
@@ -1776,9 +1967,42 @@ def shuffle_train_stream(args, stream):
     return stream
 
 
+def shard_train_stream_for_rank(
+    stream,
+    rank: int,
+    world_size: int,
+) -> Tuple[Any, int, int]:
+    """Shard a streaming source for DDP.
+
+    Prefer HuggingFace's data-source sharding when the stream exposes enough
+    underlying shards. Local single-file streams cannot be split that way; for
+    those we fall back to rank-striding inside ``PackedStream`` so tests and
+    small local corpora still exercise true per-rank batches.
+    """
+    world_size = int(world_size)
+    rank = int(rank)
+    if world_size <= 1:
+        return stream, 1, 0
+    n_shards = getattr(stream, "n_shards", None)
+    if n_shards is None:
+        n_shards = getattr(stream, "num_shards", None)
+    if n_shards is not None and int(n_shards) >= world_size:
+        return stream.shard(num_shards=world_size, index=rank), 1, 0
+    if is_main_process():
+        detail = "unknown" if n_shards is None else str(n_shards)
+        print(
+            "  Streaming source has "
+            f"{detail} data shard(s) for world_size={world_size}; "
+            "using rank-stride fallback."
+        )
+    return stream, world_size, rank
+
+
 def build_streaming_loaders(
     args: argparse.Namespace,
     tokenizer,
+    rank: int = 0,
+    world_size: int = 1,
 ):
     """Build (train, val) loaders for a streaming dataset source.
 
@@ -1814,19 +2038,33 @@ def build_streaming_loaders(
     train_stream = shuffle_train_stream(
         args, load_dataset(**load_kwargs).skip(args.val_docs),
     )
+    train_stream, rank_stride, rank_offset = shard_train_stream_for_rank(
+        train_stream, rank, world_size,
+    )
 
-    val_docs = val_docs_full
+    val_docs = (
+        val_docs_full[int(rank):: int(world_size)]
+        if int(world_size) > 1 else val_docs_full
+    )
 
     # ``base_offset`` only shifts the diagnostic ``source_idx`` counter;
     # ``resume_state`` (the HF state_dict) is what actually positions the
     # stream on resume. Only the train stream is stateful + emits source_idx
     # (the eval path never sees it).
-    train_base_offset = int(getattr(args, "stream_docs_consumed", 0) or 0)
+    train_base_offset = (
+        0 if int(world_size) > 1
+        else int(getattr(args, "stream_docs_consumed", 0) or 0)
+    )
+    rank_stream_state = select_rank_stream_state(
+        getattr(args, "stream_state", None), rank, world_size,
+    )
     train_ds = PackedStream(train_stream, tokenizer, args.max_length,
                             text_key=args.text_column,
                             base_offset=train_base_offset,
                             emit_source_idx=True,
-                            resume_state=getattr(args, "stream_state", None))
+                            resume_state=rank_stream_state,
+                            rank_stride=rank_stride,
+                            rank_offset=rank_offset)
     val_ds = PackedStream(val_docs, tokenizer, args.max_length,
                           text_key=args.text_column)
 
@@ -1868,6 +2106,8 @@ def build_streaming_train_loader(
     args: argparse.Namespace,
     tokenizer,
     block_size: int,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
     load_kwargs = _dataset_load_kwargs(
         args.dataset, args.dataset_config,
@@ -1876,12 +2116,23 @@ def build_streaming_train_loader(
     train_stream = shuffle_train_stream(
         args, load_dataset(**load_kwargs).skip(args.val_docs),
     )
-    train_base_offset = int(getattr(args, "stream_docs_consumed", 0) or 0)
+    train_stream, rank_stride, rank_offset = shard_train_stream_for_rank(
+        train_stream, rank, world_size,
+    )
+    train_base_offset = (
+        0 if int(world_size) > 1
+        else int(getattr(args, "stream_docs_consumed", 0) or 0)
+    )
+    rank_stream_state = select_rank_stream_state(
+        getattr(args, "stream_state", None), rank, world_size,
+    )
     train_ds = PackedStream(train_stream, tokenizer, block_size,
                             text_key=args.text_column,
                             base_offset=train_base_offset,
                             emit_source_idx=True,
-                            resume_state=getattr(args, "stream_state", None))
+                            resume_state=rank_stream_state,
+                            rank_stride=rank_stride,
+                            rank_offset=rank_offset)
 
     def collate(batch):
         return {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
@@ -1932,6 +2183,10 @@ def evaluate(
         count += finite.to(torch.float64)
         skipped += (~finite).to(torch.float64)
     model.train(was_training)
+    stats = all_reduce_sum(torch.cat([loss_sum, count, skipped]))
+    loss_sum = stats[0:1]
+    count = stats[1:2]
+    skipped = stats[2:3]
     n = count.item()
     n_skipped = int(skipped.item())
     if n == 0:
@@ -2019,6 +2274,7 @@ def run_step_training(
     grad_clip = args.grad_clip
     log_every = max(1, args.log_every)
     main = is_main_process()
+    world_size = distributed_world_size()
     if main:
         print("\n" + "=" * 60)
         resume_note = f" | resuming at step {start_step}" if start_step else ""
@@ -2068,6 +2324,7 @@ def run_step_training(
     train_loaders: Dict[int, DataLoader] = {1: train_loader}
     if phase1_steps > 0 and phase1_train_loader is not None:
         train_loaders[int(args.token_superposition_bag_size)] = phase1_train_loader
+    loader_epochs: Dict[int, int] = {}
     # Track the previously-active loader so the phase-1 -> phase-2 handoff can
     # transfer phase 1's live stream position into phase 2 (see the loop body).
     prev_bag_size: Optional[int] = None
@@ -2077,7 +2334,8 @@ def run_step_training(
     # reflects total progress. NOTE: the actual resume position is the HF
     # ``stream_state`` captured from the live train loader at save time, not
     # this count (see ``_capture_stream_state``).
-    docs_consumed = int(getattr(args, "stream_docs_consumed", 0) or 0)
+    consumed_resume = int(getattr(args, "stream_docs_consumed", 0) or 0)
+    docs_consumed = consumed_resume
     # One-shot resume marker so a wandb run started from a checkpoint records
     # where it picked up (step + corpus position) instead of silently
     # continuing the x-axis. Logged once, before the first optimizer step.
@@ -2096,6 +2354,8 @@ def run_step_training(
         active_loader = train_loaders[bag_size]
         train_iter = train_iters.get(bag_size)
         if train_iter is None:
+            loader_epoch = loader_epochs.get(bag_size, 0)
+            _set_distributed_sampler_epoch(active_loader, loader_epoch)
             # In-process phase-1 -> phase-2 handoff: when phase 2 (bag_size 1)
             # first starts AND phase 1 actually ran this process, transfer
             # phase 1's live HF stream position into phase 2's source so it
@@ -2113,6 +2373,9 @@ def run_step_training(
         try:
             batch = next(train_iter)
         except StopIteration:
+            loader_epoch = loader_epochs.get(bag_size, 0) + 1
+            loader_epochs[bag_size] = loader_epoch
+            _set_distributed_sampler_epoch(active_loader, loader_epoch)
             train_iter = iter(active_loader)
             train_iters[bag_size] = train_iter
             batch = next(train_iter)
@@ -2124,7 +2387,14 @@ def run_step_training(
         # single-process so this max tracks the strictly-committed position.
         batch_source_idx = batch.pop("source_idx", None)
         if batch_source_idx is not None and main:
-            docs_consumed = max(docs_consumed, int(batch_source_idx.max()) + 1)
+            local_max = int(batch_source_idx.max())
+            if world_size > 1:
+                docs_consumed = max(
+                    docs_consumed,
+                    consumed_resume + (local_max + 1) * world_size,
+                )
+            else:
+                docs_consumed = max(docs_consumed, local_max + 1)
 
         ids = batch["input_ids"].to(device, non_blocking=True)
         lbls = batch["labels"].to(device, non_blocking=True)
@@ -2177,9 +2447,12 @@ def run_step_training(
         finite_scalars = [loss.detach().reshape(1)]
         if grad_norm is not None:
             finite_scalars.append(grad_norm.detach().reshape(1))
-        finite_check = torch.isfinite(
+        finite_check_local = torch.isfinite(
             torch.cat(finite_scalars)
-        ).all().item()
+        ).all()
+        finite_check = bool(
+            all_reduce_min(finite_check_local.to(torch.int32)).item()
+        )
 
         topk_indices = outputs.get("topk_indices")
         if finite_check:
@@ -2241,7 +2514,8 @@ def run_step_training(
             stack_parts.extend(
                 n.detach().reshape(1) for n in per_group_grad_norms
             )
-            scalars = torch.cat(stack_parts).cpu().tolist()
+            metric_tensor = all_reduce_mean(torch.cat(stack_parts))
+            scalars = metric_tensor.cpu().tolist()
             loss_val = scalars[0]
             lm_loss_val = scalars[1]
             aux_loss_val = scalars[2]
@@ -2255,9 +2529,10 @@ def run_step_training(
             if grad_norm_val > grad_clip:
                 grad_clip_events += 1
         else:
-            scalars = torch.cat(
+            metric_tensor = all_reduce_mean(torch.cat(
                 [loss_d, lm_loss_d, aux_loss_d, indexer_loss_d]
-            ).cpu().tolist()
+            ))
+            scalars = metric_tensor.cpu().tolist()
             loss_val = scalars[0]
             lm_loss_val = scalars[1]
             aux_loss_val = scalars[2]
@@ -2279,7 +2554,9 @@ def run_step_training(
         # the muon_hp ramp is active, grad norm, and the running token
         # count so plots can be x-axis'd by tokens instead of steps.
         if main:
-            tokens_seen = token_superposition_tokens_seen(args, step, total_steps)
+            tokens_seen = token_superposition_tokens_seen(
+                args, step, total_steps, world_size,
+            )
             metrics = {
                 "train/loss": loss_val,
                 "train/lm_loss": lm_loss_val,
@@ -2318,8 +2595,10 @@ def run_step_training(
             elapsed = time.time() - t0
             # Tokens/sec for the current run, counting only post-resume steps.
             tokens_this_run = (
-                token_superposition_tokens_seen(args, step, total_steps)
-                - token_superposition_tokens_seen(args, start_step, total_steps)
+                token_superposition_tokens_seen(args, step, total_steps, world_size)
+                - token_superposition_tokens_seen(
+                    args, start_step, total_steps, world_size,
+                )
             )
             tps = tokens_this_run / max(elapsed, 1)
             postfix = {
@@ -2456,8 +2735,12 @@ def run_step_training(
         # Capture the live HF stream position of whichever loader is currently
         # driving (phase-1 or phase-2 under TST) so resume continues from here.
         # Only meaningful for the streaming path; None otherwise.
-        stream_state = (
+        local_stream_state = (
             _capture_stream_state(active_loader)
+            if args.streaming and (save_due or eval_due) else None
+        )
+        stream_state = (
+            pack_rank_stream_states(local_stream_state)
             if args.streaming and (save_due or eval_due) else None
         )
 
@@ -2557,7 +2840,8 @@ def run_step_training(
     # Training ends in phase 2 (standard NTP), so the standard ``train_loader``
     # is the right loader to capture for a resume from the final checkpoint.
     final_stream_state = (
-        _capture_stream_state(train_loader) if args.streaming else None
+        pack_rank_stream_states(_capture_stream_state(train_loader))
+        if args.streaming else None
     )
     return {
         "best_val_loss": best_val_loss,
@@ -3031,20 +3315,32 @@ def main(args: Optional[argparse.Namespace] = None):
         args = build_arg_parser().parse_args()
     validate_token_superposition_args(args)
 
+    rank, world_size, local_rank = init_distributed_from_env()
     main_proc = is_main_process()
 
-    torch.manual_seed(args.seed)
+    torch.manual_seed(args.seed + rank)
 
-    if args.device:
+    if is_distributed() and torch.cuda.is_available():
+        device = torch.device("cuda", local_rank)
+        if args.device and main_proc:
+            print(
+                "  DDP launch detected; ignoring --device and using "
+                "one CUDA device per LOCAL_RANK."
+            )
+    elif args.device:
         device = torch.device(args.device)
     elif torch.cuda.is_available():
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
     if main_proc:
-        print(f"Using device: {device} | model: {args.model}")
+        print(
+            f"Using device: {device} | model: {args.model} "
+            f"| world_size={world_size}"
+        )
 
     if device.type == "cuda":
+        torch.cuda.set_device(device)
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
 
@@ -3060,7 +3356,7 @@ def main(args: Optional[argparse.Namespace] = None):
         save_dir.mkdir(parents=True, exist_ok=True)
     barrier()
 
-    wandb_run = init_wandb(args)
+    wandb_run = init_wandb(args) if main_proc else None
     if wandb_run is not None:
         print(f"  W&B run: {wandb_run.url}")
 
@@ -3079,11 +3375,13 @@ def main(args: Optional[argparse.Namespace] = None):
                 "batch_size * max_length."
             )
         if args.total_tokens is not None:
-            tokens_per_step = args.batch_size * args.max_length
-            args.total_steps = derive_steps_from_token_budget(args, args.total_tokens)
+            tokens_per_step = world_size * args.batch_size * args.max_length
+            args.total_steps = derive_steps_from_token_budget(
+                args, args.total_tokens, world_size,
+            )
             if main_proc:
                 actual_tokens = token_superposition_tokens_seen(
-                    args, args.total_steps, args.total_steps,
+                    args, args.total_steps, args.total_steps, world_size,
                 )
                 phase_note = ""
                 if token_superposition_enabled(args):
@@ -3135,7 +3433,7 @@ def main(args: Optional[argparse.Namespace] = None):
                     "restarts from the head (no exact data resume)"
                 )
         train_loader, val_loader = build_streaming_loaders(
-            args, tokenizer,
+            args, tokenizer, rank=rank, world_size=world_size,
         )
         if token_superposition_enabled(args):
             phase1_block_size = token_superposition_phase1_block_size(args)
@@ -3146,6 +3444,7 @@ def main(args: Optional[argparse.Namespace] = None):
                 )
             phase1_train_loader = build_streaming_train_loader(
                 args, tokenizer, phase1_block_size,
+                rank=rank, world_size=world_size,
             )
     else:
         # ``--dataset`` may be a Hub name, a local file (.json/.csv/.txt),
@@ -3222,12 +3521,16 @@ def main(args: Optional[argparse.Namespace] = None):
             num_workers=args.num_workers,
             prefetch_factor=args.prefetch_factor,
             seed=args.seed,
+            rank=rank,
+            world_size=world_size,
         )
         val_loader = create_dataloader(
             dataset["validation"], args.batch_size, shuffle=False,
             num_workers=args.num_workers,
             prefetch_factor=args.prefetch_factor,
             seed=args.seed,
+            rank=rank,
+            world_size=world_size,
         )
         phase1_train_loader = None
         if phase1_dataset is not None:
@@ -3236,6 +3539,8 @@ def main(args: Optional[argparse.Namespace] = None):
                 num_workers=args.num_workers,
                 prefetch_factor=args.prefetch_factor,
                 seed=args.seed,
+                rank=rank,
+                world_size=world_size,
             )
 
     config, model = build_model(args, vocab_size=tokenizer.vocab_size)
@@ -3368,6 +3673,20 @@ def main(args: Optional[argparse.Namespace] = None):
               f"{save_dir}, starting fresh")
     barrier()
 
+    if is_distributed():
+        ddp_kwargs: Dict[str, Any] = {}
+        if device.type == "cuda":
+            ddp_kwargs.update(
+                device_ids=[device.index],
+                output_device=device.index,
+            )
+        model = DistributedDataParallel(model, **ddp_kwargs)
+        if main_proc:
+            print(
+                "  DDP enabled: "
+                f"world_size={world_size}, backend={dist.get_backend()}"
+            )
+
     def sample_text(prompt: str, max_new_tokens: int, temperature: float) -> str:
         raw_model.train(False)
         prompt_ids = torch.tensor(
@@ -3489,6 +3808,7 @@ def main(args: Optional[argparse.Namespace] = None):
             print("Training complete!")
         if wandb_run is not None:
             wandb_run.finish()
+        cleanup_distributed()
         return
 
     if main_proc:
@@ -3663,6 +3983,7 @@ def main(args: Optional[argparse.Namespace] = None):
         print("Training complete!")
     if wandb_run is not None:
         wandb_run.finish()
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

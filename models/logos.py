@@ -41,6 +41,7 @@ from models.hybrid import (
 from models.residual import BlockAttentionResidual
 from models.lm_loss import (
     chunked_linear_cross_entropy,
+    chunked_token_superposition_cross_entropy,
     lm_cross_entropy_from_logits,
     standard_lm_cross_entropy,
     token_superposition_attention_mask,
@@ -309,7 +310,17 @@ class LogosTransformer(nn.Module):
         logits: Optional[torch.Tensor] = None,
         token_superposition_bag_size: int = 1,
     ) -> torch.Tensor:
+        chunk_size = int(getattr(self.config, "lm_head_chunk_size", 0) or 0)
         if int(token_superposition_bag_size) > 1:
+            if chunk_size > 0 and logits is None:
+                return chunked_token_superposition_cross_entropy(
+                    hidden,
+                    self.lm_head.weight,
+                    labels,
+                    int(token_superposition_bag_size),
+                    chunk_size=chunk_size,
+                    ignore_index=-100,
+                )
             if logits is None:
                 logits = self.lm_head(hidden)
             return lm_cross_entropy_from_logits(
@@ -318,7 +329,6 @@ class LogosTransformer(nn.Module):
                 token_superposition_bag_size=token_superposition_bag_size,
                 ignore_index=-100,
             )
-        chunk_size = int(getattr(self.config, "lm_head_chunk_size", 0) or 0)
         if chunk_size > 0 and logits is None:
             return chunked_linear_cross_entropy(
                 hidden,
@@ -446,7 +456,6 @@ class LogosTransformer(nn.Module):
         x = self.final_norm(h_main)
         use_chunked_lm_loss = (
             labels is not None
-            and int(token_superposition_bag_size) <= 1
             and int(getattr(self.config, "lm_head_chunk_size", 0) or 0) > 0
         )
         logits = None if use_chunked_lm_loss else self.lm_head(x)
