@@ -3223,6 +3223,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Show TorchInductor max-autotune benchmark tables. "
                              "By default they are suppressed because they can "
                              "emit thousands of stderr lines on large models.")
+    parser.add_argument("--ddp-static-graph",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Pass static_graph to DistributedDataParallel. "
+                             "Logos has a fixed parameter-use pattern for a "
+                             "given config, so this avoids per-iteration DDP "
+                             "graph bookkeeping and supports activation "
+                             "checkpointing cleanly. Use "
+                             "--no-ddp-static-graph if experimenting with "
+                             "dynamic parameter usage.")
+    parser.add_argument("--ddp-gradient-as-bucket-view",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Pass gradient_as_bucket_view to DDP. This "
+                             "reduces peak grad memory and removes the copy "
+                             "from all-reduce buckets back into .grad tensors.")
+    parser.add_argument("--ddp-broadcast-buffers",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Pass broadcast_buffers to DDP. Keeping this on "
+                             "is safest for MoE router-bias buffers; disabling "
+                             "it can shave a tiny per-forward sync when all "
+                             "buffer updates are already rank-synchronized.")
+    parser.add_argument("--ddp-bucket-cap-mb", type=int, default=0,
+                        help="DDP all-reduce bucket size in MiB. 0 uses "
+                             "PyTorch's default. On NVLink boxes, try 64 or "
+                             "128 if NCCL launch overhead dominates; try "
+                             "smaller values if overlap with backward is poor.")
     parser.add_argument("--bf16", action="store_true",
                         help="Enable bfloat16 mixed precision (Ampere+)")
     parser.add_argument("--wandb", action="store_true",
@@ -3674,7 +3699,17 @@ def main(args: Optional[argparse.Namespace] = None):
     barrier()
 
     if is_distributed():
-        ddp_kwargs: Dict[str, Any] = {}
+        ddp_bucket_cap_mb = int(getattr(args, "ddp_bucket_cap_mb", 0) or 0)
+        if ddp_bucket_cap_mb < 0:
+            raise ValueError("--ddp-bucket-cap-mb must be >= 0")
+
+        ddp_kwargs: Dict[str, Any] = {
+            "static_graph": bool(args.ddp_static_graph),
+            "gradient_as_bucket_view": bool(args.ddp_gradient_as_bucket_view),
+            "broadcast_buffers": bool(args.ddp_broadcast_buffers),
+        }
+        if ddp_bucket_cap_mb > 0:
+            ddp_kwargs["bucket_cap_mb"] = ddp_bucket_cap_mb
         if device.type == "cuda":
             ddp_kwargs.update(
                 device_ids=[device.index],
@@ -3682,9 +3717,17 @@ def main(args: Optional[argparse.Namespace] = None):
             )
         model = DistributedDataParallel(model, **ddp_kwargs)
         if main_proc:
+            bucket_desc = (
+                str(ddp_bucket_cap_mb) if ddp_bucket_cap_mb > 0
+                else "default"
+            )
             print(
                 "  DDP enabled: "
-                f"world_size={world_size}, backend={dist.get_backend()}"
+                f"world_size={world_size}, backend={dist.get_backend()}, "
+                f"static_graph={args.ddp_static_graph}, "
+                f"gradient_as_bucket_view={args.ddp_gradient_as_bucket_view}, "
+                f"broadcast_buffers={args.ddp_broadcast_buffers}, "
+                f"bucket_cap_mb={bucket_desc}"
             )
 
     def sample_text(prompt: str, max_new_tokens: int, temperature: float) -> str:

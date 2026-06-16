@@ -26,6 +26,7 @@ data/
 .vscode/
 .idea/
 .claude/
+.codegraph/
 *.swp
 *.swo
 *~

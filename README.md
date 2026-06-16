@@ -147,6 +147,31 @@ uv run python scripts/train.py \
 
 `scripts/train.py --help` lists all flags.
 
+### W&B bakeoff
+
+Run the built-in variants as separate W&B traces on the same streaming corpus
+and token budget:
+
+```bash
+uv sync --extra wandb
+
+./scripts/run_wandb_bakeoff_1b.sh
+```
+
+The launcher runs `baseline`, `residual`, `recursive`, `linear`, `hybrid`, and
+`logos` serially with unique checkpoint directories and unique W&B run names.
+It defaults to a quick `--total-tokens 25M` benchmark, 8 GPUs, and a
+conservative per-GPU batch size of 2; override from the environment after a
+smoke run:
+
+```bash
+BATCH_SIZE=4 WANDB_PROJECT=logos-bakeoff-25m ./scripts/run_wandb_bakeoff_1b.sh
+TOTAL_TOKENS=1B RUN_NAME_PREFIX=1b RUNS_ROOT=runs/wandb-bakeoff-1b ./scripts/run_wandb_bakeoff_1b.sh
+
+# Print commands without launching training, or run a subset.
+DRY_RUN=1 ./scripts/run_wandb_bakeoff_1b.sh logos hybrid baseline
+```
+
 ## Variants
 
 The training registry currently includes:
