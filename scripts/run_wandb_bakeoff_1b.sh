@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Serial W&B bakeoff for the Logos model family.
 #
-# Defaults are chosen for an 8xH100 node, but every important knob can be
+# Defaults are chosen for a 4xH100/NVLink node, but every important knob can be
 # overridden from the environment:
 #
 #   BATCH_SIZE=4 WANDB_PROJECT=logos-bakeoff-25m ./scripts/run_wandb_bakeoff_1b.sh
@@ -16,7 +16,7 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-GPUS="${GPUS:-8}"
+GPUS="${GPUS:-4}"
 TOTAL_TOKENS="${TOTAL_TOKENS:-25M}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
