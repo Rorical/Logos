@@ -1449,11 +1449,18 @@ def prune_old_checkpoints(save_dir: Path, keep_last_n: int) -> None:
 
     Only ``checkpoint_epoch_*.pt`` files are touched — ``best`` and
     ``final`` are preserved unconditionally so they remain reachable
-    after pruning. Lex sort works because epoch is zero-padded.
+    after pruning.
     """
     if keep_last_n <= 0:
         return
-    files = sorted(save_dir.glob("checkpoint_epoch_*.pt"))
+
+    def checkpoint_step(path: Path) -> int:
+        try:
+            return int(path.stem.rsplit("_", 1)[1])
+        except (IndexError, ValueError):
+            return -1
+
+    files = sorted(save_dir.glob("checkpoint_epoch_*.pt"), key=checkpoint_step)
     if len(files) <= keep_last_n:
         return
     for old in files[:-keep_last_n]:
@@ -2693,22 +2700,23 @@ def run_step_training(
             diag_metrics = diagnostic_monitor.collect_metrics(
                 raw_model=raw_model, optimizer=optimizer,
             )
-            try:
-                def _probe_forward():
-                    with torch.autocast(
-                        device_type=device.type, dtype=mp_dtype, enabled=use_amp,
-                    ):
-                        return raw_model(
-                            input_ids=ids, attention_mask=None,
-                            labels=None, is_causal=True,
+            if args.diagnostic_probe:
+                try:
+                    def _probe_forward():
+                        with torch.autocast(
+                            device_type=device.type, dtype=mp_dtype, enabled=use_amp,
+                        ):
+                            return raw_model(
+                                input_ids=ids, attention_mask=None,
+                                labels=None, is_causal=True,
+                            )
+                    diag_metrics.update(
+                        diagnostic_monitor.probe_metrics(
+                            raw_model=raw_model, forward_fn=_probe_forward,
                         )
-                diag_metrics.update(
-                    diagnostic_monitor.probe_metrics(
-                        raw_model=raw_model, forward_fn=_probe_forward,
                     )
-                )
-            except Exception as exc:  # probe is best-effort instrumentation
-                pbar.write(f"[diag] probe skipped: {type(exc).__name__}: {exc}")
+                except Exception as exc:  # probe is best-effort instrumentation
+                    pbar.write(f"[diag] probe skipped: {type(exc).__name__}: {exc}")
             if diag_metrics:
                 wandb_log(diag_metrics, step=step)
 
@@ -3139,6 +3147,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "BlockAttentionResidual routing, KDA parameter "
                              "drift, MoE load collapse, and PPL plateaus. "
                              "Negligible overhead (<5ms/check).")
+    parser.add_argument("--diagnostic-probe", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Run the per-interval no-grad probe forward on the "
+                             "uncompiled model (materializes full logits/activations, "
+                             "~tens of GB). Disable with --no-diagnostic-probe on "
+                             "tight-memory GPUs; the cheap weight-only diagnostics "
+                             "still run.")
 
     parser.add_argument("--scheduler", type=str, default="wsd",
                         choices=["wsd", "cosine"],

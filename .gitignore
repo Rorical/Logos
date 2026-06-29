@@ -42,3 +42,6 @@ desktop.ini
 # Environment variables
 .env
 .env.local
+
+# Local remote-machine helpers may contain credentials and host details
+/remote/

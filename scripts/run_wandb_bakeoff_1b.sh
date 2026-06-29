@@ -3,10 +3,20 @@ set -euo pipefail
 
 # Serial W&B bakeoff for the Logos model family.
 #
-# Defaults are chosen for a 4xH100/NVLink node, but every important knob can be
-# overridden from the environment:
+# Goal: an ISO-FLOP architecture comparison. Every variant is SMALL and executes
+# the SAME number of transformer blocks (EFFECTIVE_DEPTH) at the SAME width
+# (D_MODEL / NUM_HEADS / D_FF), with a DENSE SwiGLU FFN (no MoE). That keeps the
+# attention-projection + FFN + depth FLOPs identical across variants, so the only
+# variable is the attention mechanism / depth-routing structure of each family.
 #
-#   BATCH_SIZE=4 WANDB_PROJECT=logos-bakeoff-25m ./scripts/run_wandb_bakeoff_1b.sh
+#   baseline / linear / hybrid : EFFECTIVE_DEPTH plain blocks
+#   residual                   : EFFECTIVE_DEPTH blocks, grouped into RESIDUAL_NUM_BLOCKS
+#   recursive / logos          : entry + body * loops + exit  ==  EFFECTIVE_DEPTH
+#
+# Defaults target a 4x A800/H100-80GB node reading a LOCAL parquet corpus, but
+# every knob is overridable from the environment, e.g.:
+#
+#   BATCH_SIZE=8 TOTAL_TOKENS=100M ./scripts/run_wandb_bakeoff_1b.sh
 #   DRY_RUN=1 ./scripts/run_wandb_bakeoff_1b.sh logos hybrid baseline
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,48 +28,53 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 GPUS="${GPUS:-4}"
 TOTAL_TOKENS="${TOTAL_TOKENS:-25M}"
-BATCH_SIZE="${BATCH_SIZE:-2}"
-MAX_LENGTH="${MAX_LENGTH:-4096}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+MAX_LENGTH="${MAX_LENGTH:-2048}"
 
-DATASET="${DATASET:-HuggingFaceFW/fineweb-edu}"
-DATASET_CONFIG="${DATASET_CONFIG:-sample-100BT}"
-TEXT_COLUMN="${TEXT_COLUMN:-text}"
+# Local parquet corpus (text column "content"). A HF hub name also works.
+DATASET="${DATASET:-/root/autodl-tmp/datasets/ultrafineweb-l3-en-qa}"
+DATASET_CONFIG="${DATASET_CONFIG:-}"
+TEXT_COLUMN="${TEXT_COLUMN:-content}"
 TOKENIZER="${TOKENIZER:-cl100k_base}"
 VAL_DOCS="${VAL_DOCS:-200}"
 
-WANDB_PROJECT="${WANDB_PROJECT:-logos-bakeoff-25m}"
+WANDB_PROJECT="${WANDB_PROJECT:-logos-bakeoff-isoflop}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
-WANDB_MODE="${WANDB_MODE:-online}"
-RUN_NAME_PREFIX="${RUN_NAME_PREFIX:-25m}"
-RUNS_ROOT="${RUNS_ROOT:-runs/wandb-bakeoff-25m}"
+WANDB_MODE="${WANDB_MODE:-offline}"
+RUN_NAME_PREFIX="${RUN_NAME_PREFIX:-isoflop}"
+RUNS_ROOT="${RUNS_ROOT:-runs/bakeoff-isoflop}"
 
 NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-8}"
 LOG_EVERY="${LOG_EVERY:-25}"
-EVAL_EVERY="${EVAL_EVERY:-500}"
+EVAL_EVERY="${EVAL_EVERY:-200}"
 SAVE_EVERY="${SAVE_EVERY:-1000}"
 SAMPLE_EVERY="${SAMPLE_EVERY:-1000}"
 KEEP_LAST_N="${KEEP_LAST_N:-2}"
 DIAGNOSTIC_EVERY="${DIAGNOSTIC_EVERY:-100}"
-MOE_LOG_EVERY="${MOE_LOG_EVERY:-500}"
 OPT_STATE_LOG_EVERY="${OPT_STATE_LOG_EVERY:-500}"
 RESUME="${RESUME:-auto}"
 DRY_RUN="${DRY_RUN:-0}"
 COMPILE="${COMPILE:-1}"
 COMPILE_MODE="${COMPILE_MODE:-default}"
 
-D_MODEL="${D_MODEL:-1024}"
-NUM_HEADS="${NUM_HEADS:-16}"
+# --- Shared (iso-FLOP) model geometry ------------------------------------------
+D_MODEL="${D_MODEL:-512}"
+NUM_HEADS="${NUM_HEADS:-8}"
 HEAD_DIM="${HEAD_DIM:-64}"
-D_FF="${D_FF:-2730}"
-NONLOOP_LAYERS="${NONLOOP_LAYERS:-22}"
-RESIDUAL_NUM_BLOCKS="${RESIDUAL_NUM_BLOCKS:-11}"
+D_FF="${D_FF:-1364}"          # ~ (8/3) * d_model, dense SwiGLU intermediate
 
+# Effective executed transformer blocks per forward pass (held equal for all).
+EFFECTIVE_DEPTH="${EFFECTIVE_DEPTH:-12}"
+RESIDUAL_NUM_BLOCKS="${RESIDUAL_NUM_BLOCKS:-4}"   # must divide EFFECTIVE_DEPTH
+
+# Looped families: entry + body * loops + exit must equal EFFECTIVE_DEPTH.
 NUM_ENTRY_LAYERS="${NUM_ENTRY_LAYERS:-2}"
-NUM_BODY_LAYERS="${NUM_BODY_LAYERS:-6}"
+NUM_BODY_LAYERS="${NUM_BODY_LAYERS:-2}"
 NUM_EXIT_LAYERS="${NUM_EXIT_LAYERS:-2}"
-NUM_LOOPS="${NUM_LOOPS:-3}"
+NUM_LOOPS="${NUM_LOOPS:-4}"
 
+# --- Attention sub-mechanism knobs (hybrid / logos / linear) -------------------
 CHUNK_SIZE="${CHUNK_SIZE:-128}"
 CONV_SIZE="${CONV_SIZE:-4}"
 SWA_WINDOW="${SWA_WINDOW:-256}"
@@ -70,39 +85,23 @@ CSA_TOP_K="${CSA_TOP_K:-64}"
 CSA_INDEXER_HEADS="${CSA_INDEXER_HEADS:-4}"
 CSA_INDEXER_DIM="${CSA_INDEXER_DIM:-32}"
 HCA_COMPRESSION="${HCA_COMPRESSION:-128}"
-LM_HEAD_CHUNK_SIZE="${LM_HEAD_CHUNK_SIZE:-4096}"
+LM_HEAD_CHUNK_SIZE="${LM_HEAD_CHUNK_SIZE:-2048}"
 CKPT_GRANULARITY="${CKPT_GRANULARITY:-per-block}"
 
+# Attention schedules. hybrid cycles over EFFECTIVE_DEPTH; logos sections expand to
+# entry / (body*loops) / exit. All four kinds (hca,csa,swa,kda) appear in each.
+HYBRID_ATTN_PATTERN="${HYBRID_ATTN_PATTERN:-hca,kda,swa,kda,csa,kda}"
 ENTRY_ATTN_PATTERN="${ENTRY_ATTN_PATTERN:-hca,kda}"
-BODY_ATTN_PATTERN="${BODY_ATTN_PATTERN:-hca,csa,kda,swa,csa,kda,csa,hca,kda,swa,csa,kda,csa,csa,kda,swa,hca,kda}"
+BODY_ATTN_PATTERN="${BODY_ATTN_PATTERN:-swa,kda,csa,kda,swa,kda,hca,kda}"
 EXIT_ATTN_PATTERN="${EXIT_ATTN_PATTERN:-csa,swa}"
-HYBRID_ATTN_PATTERN="${HYBRID_ATTN_PATTERN:-hca,kda,hca,csa,kda,swa,csa,kda,csa,hca,kda,swa,csa,kda,csa,csa,kda,swa,hca,kda,csa,swa}"
 
-NUM_SHARED_EXPERTS="${NUM_SHARED_EXPERTS:-2}"
-NUM_SPARSE_EXPERTS="${NUM_SPARSE_EXPERTS:-32}"
-TOP_K="${TOP_K:-6}"
-ENTRY_TOP_K="${ENTRY_TOP_K:-12}"
-EXIT_TOP_K="${EXIT_TOP_K:-12}"
-EXPERT_D_FF="${EXPERT_D_FF:-832}"
-CAPACITY_FACTOR="${CAPACITY_FACTOR:-2.0}"
-MOE_DIVERSITY_FACTOR="${MOE_DIVERSITY_FACTOR:-0}"
-BIAS_UPDATE_RATE="${BIAS_UPDATE_RATE:-0.02}"
-ROUTER_BIAS_ERROR_CLIP="${ROUTER_BIAS_ERROR_CLIP:-1.0}"
-ROUTER_BIAS_CLIP="${ROUTER_BIAS_CLIP:-1.0}"
-ROUTER_LOGIT_NOISE_STD="${ROUTER_LOGIT_NOISE_STD:-0.08}"
-ROUTER_LOGIT_NOISE_DECAY_STEPS="${ROUTER_LOGIT_NOISE_DECAY_STEPS:-1000}"
-ROUTER_INIT_STD="${ROUTER_INIT_STD:-0.002}"
-MOE_AUX_LOSS_WEIGHT="${MOE_AUX_LOSS_WEIGHT:-1e-3}"
-MOE_AUX_LOSS_DECAY_STEPS="${MOE_AUX_LOSS_DECAY_STEPS:-1000}"
-
+# --- Optimization --------------------------------------------------------------
 LR="${LR:-0.002}"
 EMBED_LR="${EMBED_LR:-0.04}"
 MUON_LR="${MUON_LR:-0.004}"
-ROUTER_LR="${ROUTER_LR:-5e-4}"
-ROUTER_WARMUP_STEPS="${ROUTER_WARMUP_STEPS:-500}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 GRAD_CLIP="${GRAD_CLIP:-5.0}"
-WARMUP_STEPS="${WARMUP_STEPS:-500}"
+WARMUP_STEPS="${WARMUP_STEPS:-50}"
 DECAY_STEPS="${DECAY_STEPS:-}"
 DECAY_FRAC="${DECAY_FRAC:-0.2}"
 EMA_DECAY="${EMA_DECAY:-0.0}"
@@ -117,10 +116,20 @@ else
   VARIANTS=(baseline residual recursive linear hybrid logos)
 fi
 
+# Sanity: looped depth and residual grouping must reconcile with EFFECTIVE_DEPTH.
+looped_depth=$(( NUM_ENTRY_LAYERS + NUM_BODY_LAYERS * NUM_LOOPS + NUM_EXIT_LAYERS ))
+if [[ "$looped_depth" -ne "$EFFECTIVE_DEPTH" ]]; then
+  echo "ERROR: entry+body*loops+exit ($looped_depth) != EFFECTIVE_DEPTH ($EFFECTIVE_DEPTH)" >&2
+  exit 2
+fi
+if (( EFFECTIVE_DEPTH % RESIDUAL_NUM_BLOCKS != 0 )); then
+  echo "ERROR: EFFECTIVE_DEPTH ($EFFECTIVE_DEPTH) not divisible by RESIDUAL_NUM_BLOCKS ($RESIDUAL_NUM_BLOCKS)" >&2
+  exit 2
+fi
+
 shared_args=(
   --streaming
   --dataset "$DATASET"
-  --dataset-config "$DATASET_CONFIG"
   --text-column "$TEXT_COLUMN"
   --val-docs "$VAL_DOCS"
   --tiktoken-encoding "$TOKENIZER"
@@ -150,30 +159,12 @@ shared_args=(
   --csa-indexer-heads "$CSA_INDEXER_HEADS"
   --csa-indexer-dim "$CSA_INDEXER_DIM"
   --hca-compression "$HCA_COMPRESSION"
-  --use-moe
-  --num-shared-experts "$NUM_SHARED_EXPERTS"
-  --num-sparse-experts "$NUM_SPARSE_EXPERTS"
-  --top-k "$TOP_K"
-  --expert-d-ff "$EXPERT_D_FF"
-  --capacity-factor "$CAPACITY_FACTOR"
-  --moe-diversity-factor "$MOE_DIVERSITY_FACTOR"
-  --bias-update-rate "$BIAS_UPDATE_RATE"
-  --router-bias-error-clip "$ROUTER_BIAS_ERROR_CLIP"
-  --router-bias-clip "$ROUTER_BIAS_CLIP"
-  --router-logit-noise-std "$ROUTER_LOGIT_NOISE_STD"
-  --router-logit-noise-decay-steps "$ROUTER_LOGIT_NOISE_DECAY_STEPS"
-  --router-init-std "$ROUTER_INIT_STD"
-  --moe-aux-loss-weight "$MOE_AUX_LOSS_WEIGHT"
-  --moe-aux-loss-decay-steps "$MOE_AUX_LOSS_DECAY_STEPS"
-  --moe-log-every "$MOE_LOG_EVERY"
   --lm-head-chunk-size "$LM_HEAD_CHUNK_SIZE"
   --muon
   --muon-schedule-hyperparams
   --lr "$LR"
   --embed-lr "$EMBED_LR"
   --muon-lr "$MUON_LR"
-  --router-lr "$ROUTER_LR"
-  --router-warmup-steps "$ROUTER_WARMUP_STEPS"
   --weight-decay "$WEIGHT_DECAY"
   --grad-clip "$GRAD_CLIP"
   --scheduler wsd
@@ -189,6 +180,10 @@ shared_args=(
   --wandb-project "$WANDB_PROJECT"
   --wandb-mode "$WANDB_MODE"
 )
+
+if [[ -n "$DATASET_CONFIG" ]]; then
+  shared_args+=(--dataset-config "$DATASET_CONFIG")
+fi
 
 if [[ -n "$WANDB_ENTITY" ]]; then
   shared_args+=(--wandb-entity "$WANDB_ENTITY")
@@ -213,12 +208,12 @@ for variant in "${VARIANTS[@]}"; do
 
   case "$variant" in
     baseline)
-      model_args=(--model baseline --num-layers "$NONLOOP_LAYERS")
+      model_args=(--model baseline --num-layers "$EFFECTIVE_DEPTH")
       ;;
     residual)
       model_args=(
         --model residual
-        --num-layers "$NONLOOP_LAYERS"
+        --num-layers "$EFFECTIVE_DEPTH"
         --num-blocks "$RESIDUAL_NUM_BLOCKS"
       )
       ;;
@@ -232,12 +227,12 @@ for variant in "${VARIANTS[@]}"; do
       )
       ;;
     linear)
-      model_args=(--model linear --num-layers "$NONLOOP_LAYERS")
+      model_args=(--model linear --num-layers "$EFFECTIVE_DEPTH")
       ;;
     hybrid)
       model_args=(
         --model hybrid
-        --num-layers "$NONLOOP_LAYERS"
+        --num-layers "$EFFECTIVE_DEPTH"
         --attn-pattern "$HYBRID_ATTN_PATTERN"
       )
       ;;
@@ -251,10 +246,6 @@ for variant in "${VARIANTS[@]}"; do
         --entry-attn-pattern "$ENTRY_ATTN_PATTERN"
         --body-attn-pattern "$BODY_ATTN_PATTERN"
         --exit-attn-pattern "$EXIT_ATTN_PATTERN"
-        --entry-top-k "$ENTRY_TOP_K"
-        --exit-top-k "$EXIT_TOP_K"
-        --gradient-checkpointing
-        --ckpt-granularity "$CKPT_GRANULARITY"
       )
       ;;
     *)
@@ -275,20 +266,20 @@ for variant in "${VARIANTS[@]}"; do
     --wandb-run-name "$run_name"
     --wandb-tags
     bakeoff
+    isoflop
     "$variant"
     "$TOTAL_TOKENS"
-    "$DATASET"
-    "$DATASET_CONFIG"
     "gpus-$GPUS"
   )
 
   echo
   echo "================================================================"
   echo "Starting W&B bakeoff run: $run_name"
-  echo "  variant:      $variant"
-  echo "  save_dir:     $save_dir"
-  echo "  token budget: $TOTAL_TOKENS"
-  echo "  per-GPU batch:$BATCH_SIZE x $MAX_LENGTH"
+  echo "  variant:        $variant"
+  echo "  effective depth:$EFFECTIVE_DEPTH blocks  (d_model=$D_MODEL d_ff=$D_FF dense)"
+  echo "  save_dir:       $save_dir"
+  echo "  token budget:   $TOTAL_TOKENS"
+  echo "  per-GPU batch:  $BATCH_SIZE x $MAX_LENGTH  on $GPUS GPUs"
   echo "================================================================"
 
   if [[ "$DRY_RUN" == "1" ]]; then

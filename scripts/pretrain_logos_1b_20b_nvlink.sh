@@ -120,6 +120,7 @@ EVAL_EVERY="${EVAL_EVERY:-1000}"
 SAVE_EVERY="${SAVE_EVERY:-5000}"
 SAMPLE_EVERY="${SAMPLE_EVERY:-20000}"
 DIAGNOSTIC_EVERY="${DIAGNOSTIC_EVERY:-100}"
+DIAGNOSTIC_PROBE="${DIAGNOSTIC_PROBE:-1}"
 MOE_LOG_EVERY="${MOE_LOG_EVERY:-1000}"
 OPT_STATE_LOG_EVERY="${OPT_STATE_LOG_EVERY:-1000}"
 
@@ -285,6 +286,10 @@ train_args=(
 
 if [[ -n "$WANDB_ENTITY" ]]; then
   train_args+=(--wandb-entity "$WANDB_ENTITY")
+fi
+
+if [[ "$DIAGNOSTIC_PROBE" != "1" ]]; then
+  train_args+=(--no-diagnostic-probe)
 fi
 
 train_args+=(
